@@ -62,6 +62,12 @@ interface Env {
 
 const MAX_REQUEST_BODY_BYTES = 102400; // 100KB gross request cap
 const HANDSHAKE_COOLDOWN_SECONDS = 86400; // 24 hours
+const MAX_OUTBOUND_PER_HOUR = 60; // server-side rate limit for messages
+const MAX_HANDSHAKES_PER_DAY = 100; // per-agent daily handshake limit
+const AGENTS_PAGE_SIZE = 50; // default page size for /agents
+const MAX_AGENTS_PAGE_SIZE = 100; // hard cap on /agents page size
+const MESSAGE_RETENTION_DAYS = 30; // delete delivered messages after this many days
+const FAILED_MESSAGE_RETENTION_DAYS = 7; // delete permanently failed messages sooner
 
 // --- Helpers ---
 
@@ -251,8 +257,29 @@ async function checkMessagePermission(
   return { allowed: false, reason: `Agent '${target.name}' is private and you have not added them as a contact` };
 }
 
+// Server-side rate limiting: checks KV for how many messages an agent sent this hour
+async function checkOutboundRateLimit(
+  agentId: string,
+  env: Env,
+  limit: number = MAX_OUTBOUND_PER_HOUR
+): Promise<boolean> {
+  const hourKey = `rate-msg:${agentId}:${Math.floor(Date.now() / 3600000)}`;
+  const current = parseInt(await env.RATE_LIMIT.get(hourKey) ?? "0", 10);
+  if (current >= limit) {
+    return false;
+  }
+  await env.RATE_LIMIT.put(hourKey, String(current + 1), { expirationTtl: 3600 });
+  return true;
+}
+
 async function handleSend(request: Request, env: Env): Promise<Response> {
   const sender = await authenticateAgent(request.headers, env.DB);
+
+  // Server-side rate limit check
+  const withinLimit = await checkOutboundRateLimit(sender.id, env);
+  if (!withinLimit) {
+    throw new HttpError(429, `Rate limit exceeded. Maximum ${MAX_OUTBOUND_PER_HOUR} messages per hour.`);
+  }
   const body = (await request.json()) as SendRequest;
 
   if (!body?.to || typeof body.to !== "string") {
@@ -356,19 +383,20 @@ async function handleInbox(request: Request, env: Env): Promise<Response> {
     .bind(agent.id, ...statuses.map(s => s as string), limit)
     .all<Record<string, unknown>>();
 
-  if (result.results.length > 0) {
+  // Batch-update all queued messages to delivered in a single query
+  const queuedIds = result.results
+    .filter(m => m.status === "queued")
+    .map(m => m.id as string);
+
+  if (queuedIds.length > 0) {
     const now = new Date().toISOString();
-    for (const msg of result.results) {
-      // Mark queued as delivered, but leave spam as spam
-      if (msg.status === "queued") {
-        await env.DB
-          .prepare(
-            "UPDATE messages SET status = 'delivered', delivered_at = ? WHERE id = ?"
-          )
-          .bind(now, msg.id as string)
-          .run();
-      }
-    }
+    const placeholders = queuedIds.map(() => "?").join(",");
+    await env.DB
+      .prepare(
+        `UPDATE messages SET status = 'delivered', delivered_at = ? WHERE id IN (${placeholders})`
+      )
+      .bind(now, ...queuedIds)
+      .run();
   }
 
   const inbox: InboxMessage[] = result.results.map((m) => ({
@@ -439,8 +467,28 @@ async function handleReply(
 async function handleAgents(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
   const query = url.searchParams.get("q") ?? "";
+  const page = Math.max(1, parseInt(url.searchParams.get("page") ?? "1"));
+  const pageSize = Math.min(
+    Math.max(1, parseInt(url.searchParams.get("limit") ?? String(AGENTS_PAGE_SIZE))),
+    MAX_AGENTS_PAGE_SIZE
+  );
+  const offset = (page - 1) * pageSize;
+
+  // Simple KV cache for the agents directory (60s TTL)
+  const cacheKey = `agents-cache:${query || "all"}:${page}:${pageSize}`;
+  const cached = await env.RATE_LIMIT.get(cacheKey);
+  if (cached) {
+    const parsed = JSON.parse(cached);
+    // Short TTL to avoid stale data; still saves DB reads
+    return new Response(JSON.stringify(parsed, null, 2), {
+      status: 200,
+      headers: { "Content-Type": "application/json", "X-Cache": "HIT" },
+    });
+  }
 
   let result: D1Result<Agent>;
+  let totalCount: number;
+
   if (query) {
     // Search by name, description (in manifest JSON), capabilities, and tags
     const searchPattern = `%${query}%`;
@@ -448,17 +496,36 @@ async function handleAgents(request: Request, env: Env): Promise<Response> {
       .prepare(
         "SELECT id, name, visibility, manifest, created_at FROM agents " +
         "WHERE name LIKE ? OR manifest LIKE ? " +
-        "ORDER BY created_at DESC"
+        "ORDER BY created_at DESC LIMIT ? OFFSET ?"
+      )
+      .bind(searchPattern, searchPattern, pageSize, offset)
+      .all<Agent>();
+
+    // Get total count for pagination metadata
+    const countResult = await env.DB
+      .prepare(
+        "SELECT COUNT(*) as count FROM agents " +
+        "WHERE name LIKE ? OR manifest LIKE ?"
       )
       .bind(searchPattern, searchPattern)
-      .all<Agent>();
+      .first<{ count: number }>();
+    totalCount = countResult?.count ?? 0;
   } else {
     result = await env.DB
-      .prepare("SELECT id, name, visibility, manifest, created_at FROM agents ORDER BY created_at DESC")
+      .prepare(
+        "SELECT id, name, visibility, manifest, created_at FROM agents ORDER BY created_at DESC LIMIT ? OFFSET ?"
+      )
+      .bind(pageSize, offset)
       .all<Agent>();
+
+    // Get total count for pagination metadata
+    const countResult = await env.DB
+      .prepare("SELECT COUNT(*) as count FROM agents")
+      .first<{ count: number }>();
+    totalCount = countResult?.count ?? 0;
   }
 
-  return jsonResponse({
+  const response = {
     agents: result.results.map((a) => ({
       id: a.id,
       name: a.name,
@@ -467,8 +534,18 @@ async function handleAgents(request: Request, env: Env): Promise<Response> {
       created_at: a.created_at,
     })),
     query: query || null,
-    total: result.results.length,
-  });
+    pagination: {
+      page,
+      page_size: pageSize,
+      total: totalCount,
+      total_pages: Math.ceil(totalCount / pageSize),
+    },
+  };
+
+  // Cache the result for 60 seconds
+  await env.RATE_LIMIT.put(cacheKey, JSON.stringify(response), { expirationTtl: 60 });
+
+  return jsonResponse(response);
 }
 
 async function handleAgentInfo(
@@ -722,7 +799,25 @@ async function handleHandshake(request: Request, env: Env): Promise<Response> {
     throw new HttpError(400, "Cannot send a handshake to yourself");
   }
 
-  // 1. Lifetime check — has a handshake already been attempted between this pair?
+  // 1. Per-agent daily spam limit — max handshakes per day from one agent
+  const todayStart = new Date();
+  todayStart.setHours(0, 0, 0, 0);
+  const dailyCountResult = await env.DB
+    .prepare(
+      "SELECT COUNT(*) as count FROM handshakes WHERE from_agent_id = ? AND created_at >= ?"
+    )
+    .bind(sender.id, todayStart.toISOString())
+    .first<{ count: number }>();
+
+  const dailyCount = dailyCountResult?.count ?? 0;
+  if (dailyCount >= MAX_HANDSHAKES_PER_DAY) {
+    return jsonResponse({
+      error: `Daily handshake limit exceeded. Maximum ${MAX_HANDSHAKES_PER_DAY} handshakes per day. (${dailyCount} used today)`,
+      status: "daily_limit",
+    }, 429);
+  }
+
+  // 2. Lifetime check — has a handshake already been attempted between this pair?
   const history = await env.DB
     .prepare(
       "SELECT id FROM handshakes WHERE from_agent_id = ? AND to_agent_id = ? LIMIT 1"
@@ -737,7 +832,7 @@ async function handleHandshake(request: Request, env: Env): Promise<Response> {
     }, 403);
   }
 
-  // 2. 24-hour cooldown check via KV
+  // 3. 24-hour cooldown check via KV
   const cacheKey = `handshake:${sender.id}:${target.id}`;
   const existingLock = await env.RATE_LIMIT.get(cacheKey);
 
@@ -748,7 +843,7 @@ async function handleHandshake(request: Request, env: Env): Promise<Response> {
     }, 429);
   }
 
-  // 3. Log the handshake in D1 (lifetime record)
+  // 4. Log the handshake in D1 (lifetime record)
   await env.DB
     .prepare(
       "INSERT INTO handshakes (id, from_agent_id, to_agent_id, status, created_at) VALUES (?, ?, ?, ?, ?)"
@@ -756,10 +851,10 @@ async function handleHandshake(request: Request, env: Env): Promise<Response> {
     .bind(generateId(), sender.id, target.id, "pending", new Date().toISOString())
     .run();
 
-  // 4. Set 24-hour TTL in KV to prevent spam
+  // 5. Set 24-hour TTL in KV to prevent spam
   await env.RATE_LIMIT.put(cacheKey, "locked", { expirationTtl: HANDSHAKE_COOLDOWN_SECONDS });
 
-  // 5. Drop a handshake message in the recipient's inbox
+  // 6. Drop a handshake message in the recipient's inbox
   const messageId = generateId();
   const replyTo = `/send/reply/${messageId}`;
 
@@ -797,9 +892,36 @@ async function handleHandshake(request: Request, env: Env): Promise<Response> {
     to: body.agent_name,
     status: "pending",
     reply_to: replyTo,
+    daily_handshake_count: dailyCount + 1,
+    daily_handshake_limit: MAX_HANDSHAKES_PER_DAY,
     message: `Handshake request sent to '${body.agent_name}'. They will receive a notification.`,
   });
 }
+
+// --- Scheduled cleanup: purge old messages to prevent unbounded DB growth ---
+
+export const scheduled: ExportedHandler<Env>["scheduled"] = async (_controller, env): Promise<void> => {
+  const now = new Date().toISOString();
+  const deliveredCutoff = new Date(Date.now() - MESSAGE_RETENTION_DAYS * 86400000).toISOString();
+  const failedCutoff = new Date(Date.now() - FAILED_MESSAGE_RETENTION_DAYS * 86400000).toISOString();
+
+  // Delete old delivered messages
+  const deliveredDeleted = await env.DB
+    .prepare("DELETE FROM messages WHERE status = 'delivered' AND delivered_at < ?")
+    .bind(deliveredCutoff)
+    .run();
+
+  // Delete old permanently failed messages
+  const failedDeleted = await env.DB
+    .prepare("DELETE FROM messages WHERE status = 'failed' AND created_at < ?")
+    .bind(failedCutoff)
+    .run();
+
+  console.log(
+    `Cleanup: deleted ${deliveredDeleted.results?.length ?? 0} delivered, ` +
+    `${failedDeleted.results?.length ?? 0} failed messages (as of ${now})`
+  );
+};
 
 // --- Request Router ---
 
@@ -893,6 +1015,9 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
 
 // --- Export ---
 
+// --- Export ---
+
 export default {
   fetch: handleRequest,
+  scheduled,
 } satisfies ExportedHandler<Env>;

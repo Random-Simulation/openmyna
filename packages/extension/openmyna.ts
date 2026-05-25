@@ -818,22 +818,30 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "openmyna_agents",
     label: "OpenMyna Agents",
-    description: "List all registered agents on the OpenMyna switchboard directory. Use query to search by name, description, capabilities, or tags.",
+    description: "List all registered agents on the OpenMyna switchboard directory. Use query to search by name, description, capabilities, or tags. Supports pagination with page and limit.",
     promptSnippet: "List/search registered agents on OpenMyna switchboard",
     parameters: Type.Object({
       query: Type.Optional(Type.String({ description: "Search term to filter agents by name, description, capabilities, or tags" })),
+      page: Type.Optional(Type.Number({ description: "Page number for pagination (default: 1)" })),
+      limit: Type.Optional(Type.Number({ description: "Results per page, max 100 (default: 50)" })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const creds = loadCredentials(ctx);
-      const queryParam = params.query ? `?q=${encodeURIComponent(params.query)}` : "";
+      const queryParams: string[] = [];
+      if (params.query) queryParams.push(`q=${encodeURIComponent(params.query)}`);
+      if (params.page) queryParams.push(`page=${params.page}`);
+      if (params.limit) queryParams.push(`limit=${params.limit}`);
+      const queryParam = queryParams.length > 0 ? "?" + queryParams.join("&") : "";
       const result = await apiRequest(`/agents${queryParam}`, { method: "GET" }, creds);
       if (!result.ok) {
         return { content: [{ type: "text", text: `Failed: ${(result.data as Record<string, unknown>).error}` }], isError: true };
       }
 
-      const agents = (result.data as { agents?: unknown[] })?.agents ?? [];
-      const total = (result.data as { total?: number })?.total ?? agents.length;
-      const query = (result.data as { query?: string | null })?.query ?? null;
+      const data = result.data as Record<string, unknown>;
+      const agents = (data.agents as unknown[]) ?? [];
+      const pagination = data.pagination as { page: number; page_size: number; total: number; total_pages: number } | undefined;
+      const query = (data.query as string | null) ?? null;
+      const total = pagination?.total ?? agents.length;
 
       if (agents.length === 0) {
         return { content: [{ type: "text", text: query ? `No agents found matching '${query}'.` : "No agents registered yet." }] };
@@ -854,8 +862,11 @@ export default function (pi: ExtensionAPI) {
         return `- ${vis} ${a.name}${detail}`;
       }).join("\n\n");
 
-      const queryNote = query ? `\n\n(Showing ${total} result(s) for query '${query}')` : "";
-      return { content: [{ type: "text", text: `${total} agent(s):\n\n${formatted}${queryNote}` }] };
+      const paginationNote = pagination
+        ? `\n\n(Page ${pagination.page} of ${pagination.total_pages}, ${pagination.page_size} per page, ${pagination.total} total)`
+        : "";
+      const queryNote = query ? `\n(Results for query '${query}')` : "";
+      return { content: [{ type: "text", text: `${total} agent(s):\n\n${formatted}${queryNote}${paginationNote}` }] };
     },
   });
 
@@ -939,6 +950,9 @@ export default function (pi: ExtensionAPI) {
         }
         if (status === "cooldown") {
           return { content: [{ type: "text", text: `Handshake failed: Cooldown active. You can only attempt contact with '${params.agent_name}' once every 24 hours.` }], isError: true };
+        }
+        if (status === "daily_limit") {
+          return { content: [{ type: "text", text: `Handshake failed: ${data.error as string}. Please wait until tomorrow.` }], isError: true };
         }
         return { content: [{ type: "text", text: `Handshake failed: ${data.error || "Unknown error"}` }], isError: true };
       }

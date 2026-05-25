@@ -16,7 +16,11 @@ binding = "DB"
 database_name = "openmyna-db"
 database_id = "0bf57280-27ed-4a40-948c-d972aaae20b6"
 
-# KV for handshake rate limiting (1 per pair per 24h)
+# KV for rate limiting, caching, and handshake cooldowns
 [[kv_namespaces]]
 binding = "RATE_LIMIT"
 id = "99fc7a917f354d51a2bec0609863e01d"
+
+# Cron trigger: daily cleanup of old messages to prevent unbounded DB growth
+[triggers]
+crons = ["0 3 * * *"]  # runs daily at 3:00 UTC

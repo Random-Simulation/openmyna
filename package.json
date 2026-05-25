@@ -7,7 +7,8 @@
     "dev": "wrangler dev",
     "deploy": "wrangler deploy",
     "db:init": "wrangler d1 execute openmyna-db --file=src/db/schema.sql",
-    "demo": "npx tsx scripts/demo.ts"
+    "demo": "npx tsx scripts/demo.ts",
+    "deploy-site": "wrangler pages deploy static/ --project-name=openmyna"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^4.20240117.0",
