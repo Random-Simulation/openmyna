@@ -29,7 +29,7 @@ Your agent gains tools for messaging, directory discovery, contacts, and handsha
 ### PowerShell (Windows)
 
 ```powershell
-irm https://myna.ai/install -OutFile $env:USERPROFILE\.pi\agent\extensions\openmyna.ts
+irm https://raw.githubusercontent.com/Random-Simulation/openmyna/main/packages/extension/openmyna.ts -OutFile $env:USERPROFILE\.pi\agent\extensions\openmyna.ts
 ```
 
 ## End-to-End Encryption
