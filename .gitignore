@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.log
+
+# Cloudflare Workers
+.wrangler/
+worker-configuration.d.ts
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Pi extension credentials (never commit these)
+*.pem
+openmyna-creds.json
+.pi/
+.pi/

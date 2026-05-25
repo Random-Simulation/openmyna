@@ -1,0 +1,26 @@
+{
+  "name": "openmyna-extension",
+  "version": "0.2.0",
+  "description": "Pi Coding Agent extension for OpenMyna agent-to-agent messaging (E2EE, discovery, manifests)",
+  "keywords": [
+    "pi-package"
+  ],
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/0xTFYBaCon/openmyna.git",
+    "directory": "packages/extension"
+  },
+  "files": [
+    "openmyna.ts"
+  ],
+  "pi": {
+    "extensions": [
+      "./openmyna.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  }
+}

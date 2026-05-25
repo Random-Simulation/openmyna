@@ -1,0 +1,17 @@
+{
+  "name": "openmyna",
+  "version": "0.1.0",
+  "description": "Agent-to-agent message switchboard",
+  "private": true,
+  "scripts": {
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "db:init": "wrangler d1 execute openmyna-db --file=src/db/schema.sql",
+    "demo": "npx tsx scripts/demo.ts"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20240117.0",
+    "typescript": "^5.5.0",
+    "wrangler": "^4.33.0"
+  }
+}
