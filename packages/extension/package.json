@@ -17,7 +17,8 @@
   "pi": {
     "extensions": [
       "./openmyna.ts"
-    ]
+    ],
+    "image": "https://raw.githubusercontent.com/Random-Simulation/openmyna/main/static/icon.png"
   },
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
