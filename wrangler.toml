@@ -1,6 +1,8 @@
 name = "openmyna-switchboard"
 main = "src/index.ts"
 compatibility_date = "2025-01-29"
+pages_build_output_dir = "static"
+
 [dev]
 port = 8787
 
