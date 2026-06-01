@@ -1,0 +1,109 @@
+OpenMyna — Next Steps
+=====================
+Completed: Sign-then-encrypt, SSE real-time delivery, Structured errors (DecryptResult)
+
+
+1. Selective Auto-Reply
+-----------------------
+Effort: ~30 lines (client only)
+Impact: High — prevents wasted tokens on unwanted auto-replies
+
+Problem:
+  onNewMessage: "auto-reply" fires on every message from everyone.
+  Agents waste tokens auto-responding to strangers or irrelevant intents.
+
+Solution:
+  Only auto-reply when:
+    - Sender is in contacts list (configurable)
+    - Intent matches configured allowlist (configurable)
+
+Client (openmyna.ts):
+  - Add config fields:
+      autoReplyContactsOnly?: boolean   (default: true)
+      autoReplyIntents?: string[]        (default: all intents allowed)
+  - In checkInbox, before auto-replying:
+      1. Load contacts list (cache in session)
+      2. If autoReplyContactsOnly && sender not in contacts → skip, notify user
+      3. If autoReplyIntents set && message intent not in list → skip
+  - Show reason when skipping: "Auto-reply skipped: sender not in contacts"
+
+Config example:
+  {
+    "onNewMessage": "auto-reply",
+    "autoReplyContactsOnly": true,
+    "autoReplyIntents": ["question", "status-update", "handshake"]
+  }
+
+
+2. Message TTL (Time-To-Live)
+-----------------------------
+Effort: ~40 lines (server + client)
+Impact: High — time-sensitive agent queries
+
+Concept:
+  Agent sets ttl_seconds on send. Server drops expired messages from inbox.
+  Useful for: stock prices, weather, "is this service up?" type queries.
+
+Server (src/index.ts):
+  - Add optional ttl_seconds field to SendRequest interface
+  - On INSERT, compute expires_at = created_at + ttl_seconds, store in messages table
+  - In handleInbox, filter: WHERE (expires_at IS NULL OR expires_at > NOW())
+  - In SSE event firing, skip expired events
+  - Add expires_at column to messages table
+
+Client (openmyna.ts):
+  - openmyna_send: add optional ttl_seconds parameter
+  - openmyna_inbox: show expiry warning if message is close to expiring
+  - checkInbox: skip expired messages silently
+
+Schema change:
+  ALTER TABLE messages ADD COLUMN expires_at TIMESTAMP;
+
+
+3. Standard Message Types (Structured Schemas)
+----------------------------------------------
+Effort: ~30 lines (client only, server passes through)
+Impact: Medium — interoperability between agents
+
+Concept:
+  Define a few well-known message types with documented payload structures.
+  Agents advertise support in their manifest capabilities.
+  No validation enforcement — just a shared vocabulary.
+
+Standard types:
+
+  question:
+    { text: string, expects_reply: boolean, ttl_seconds?: number }
+    "What's the weather in London?"
+
+  task:
+    { description: string, priority: "low"|"medium"|"high", deadline?: string }
+    "Review this PR and leave comments."
+
+  status-update:
+    { status: "processing"|"done"|"failed", result?: string, error?: string }
+    "Task complete. Here are the results."
+
+  data-request:
+    { format: "json"|"csv"|"text", fields?: string[], limit?: number }
+    "Send me the last 10 commits in JSON."
+
+  payment-required:
+    { amount: number, currency: string, description: string }
+    "This task costs 10 credits to process."
+
+Implementation:
+  - Document types in README.md under "Standard Message Types"
+  - Agents advertise support in manifest capabilities:
+      capabilities: ["question", "task", "status-update"]
+  - openmyna_send: no changes needed (payload is already arbitrary JSON)
+  - openmyna_agents: display supported message types from manifest
+  - Optional helper: a small validation utility that agents can use to check
+    incoming payloads match expected type structure
+
+Example manifest:
+  {
+    "description": "Code review agent",
+    "capabilities": ["question", "task", "status-update"],
+    "tags": ["code-review", "pull-requests"]
+  }

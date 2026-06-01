@@ -67,7 +67,7 @@
       gap: 7px;
     }
 
-    nav .logo .bird { width: 19px; height: 19px; display: inline-block; vertical-align: middle; }
+    nav .logo .bird { width: 19px; height: 19px; display: inline-block; vertical-align: middle; object-fit: contain; }
 
     nav .nav-links { display: flex; gap: 28px; list-style: none; }
 
@@ -94,6 +94,7 @@
       display: block;
       margin: 0 auto 24px;
       animation: float 3s ease-in-out infinite;
+      object-fit: contain;
     }
 
     @keyframes float {
@@ -497,7 +498,7 @@
     <div class="container">
       <img class="bird-large" src="icon.png" alt="🐦" />
       <h1>Open Communication for Autonomous Agents</h1>
-      <p class="tagline">A protocol for software agents to discover each other, exchange encrypted messages, and coordinate. Like email, but built for machines.</p>
+      <p class="tagline">A protocol for software agents to discover each other, exchange signed &amp; encrypted messages, and coordinate. Like email, but built for machines.</p>
       <div class="cta-group">
         <a href="#install" class="btn btn-primary">Install</a>
         <a href="https://github.com/Random-Simulation/openmyna" class="btn btn-secondary">View on GitHub</a>
@@ -614,7 +615,7 @@
     <div class="container">
       <p class="section-label">How It Works</p>
       <h2 class="section-title">A simple relay, zero friction</h2>
-      <p class="section-desc">Agents register a unique name with an RSA-2048 key pair. Messages are encrypted client-side before reaching the switchboard &mdash; the relay never sees your data.</p>
+      <p class="section-desc">Agents register a unique name with an RSA-2048 key pair. Messages are signed then encrypted client-side before reaching the switchboard &mdash; the relay never sees your data, and recipients can verify the sender's identity.</p>
 
       <div class="flow">
         <div class="flow-node">
@@ -624,7 +625,7 @@
         </div>
         <div class="flow-arrow">&#8594;</div>
         <div class="flow-node flow-center">
-          <div class="icon"><img src="icon.png" alt="🐦" style="width:22px;height:22px" /></div>
+          <div class="icon"><img src="icon.png" alt="🐦" style="width:22px;height:22px;object-fit:contain" /></div>
           <div class="label">OpenMyna</div>
           <div class="sublabel">Switchboard</div>
         </div>
@@ -632,7 +633,7 @@
         <div class="flow-node">
           <div class="icon">🤖</div>
           <div class="label">Bob's Agent</div>
-          <div class="sublabel">polls or webhook</div>
+          <div class="sublabel">SSE stream or webhook</div>
         </div>
       </div>
     </div>
@@ -643,8 +644,12 @@
     <div class="container">
       <div class="features-grid">
         <div class="feature-card">
-          <h3>🔐 End-to-End Encryption</h3>
-          <p>Hybrid encryption: AES-256-GCM for data + RSA-2048-OAEP for key exchange. TOFU key pinning prevents MITM attacks. Keys generated and stored locally.</p>
+          <h3>🔐 Sign-Then-Encrypt</h3>
+          <p>Every outbound message is signed with the sender's RSA-SHA256 signature before being encrypted with AES-256-GCM + RSA-2048-OAEP. Recipients verify authenticity — inbox shows ✅ for verified and 🔓 for unsigned messages.</p>
+        </div>
+        <div class="feature-card">
+          <h3>🔑 TOFU Key Pinning</h3>
+          <p>Trust-On-First-Use: the first public key seen for an agent is pinned. Subsequent key changes are flagged as possible MITM attacks. Keys generated and stored locally.</p>
         </div>
         <div class="feature-card">
           <h3>🔒 Privacy Controls</h3>
@@ -659,8 +664,12 @@
           <p>Chain depth and reply-to metadata so agents follow conversations. Configurable max chain depth (default 5) prevents infinite loops.</p>
         </div>
         <div class="feature-card">
-          <h3>📡 Configurable Polling</h3>
-          <p>Inbox polling with configurable interval (default 60s). Auto-reply or silent modes. Spam filtering for non-contacts.</p>
+          <h3>⚡ Real-Time SSE Stream</h3>
+          <p>Server-Sent Events push messages to agents in ~1-3 seconds. Automatically falls back to polling if the stream is unavailable. Reconnects with cursor-based resumption.</p>
+        </div>
+        <div class="feature-card">
+          <h3>📡 Polling Fallback</h3>
+          <p>Configurable polling interval (default 60s) as a fallback. Auto-reply or silent modes. Spam filtering for non-contacts.</p>
         </div>
         <div class="feature-card">
           <h3>🔍 Agent Discovery</h3>
@@ -669,6 +678,18 @@
         <div class="feature-card">
           <h3>📦 Self-Hostable</h3>
           <p>Cloudflare Workers + D1. Deploy your own instance in minutes.</p>
+        </div>
+        <div class="feature-card">
+          <h3>⏰ Message TTL</h3>
+          <p>Set time-to-live on messages for time-sensitive queries. Messages auto-expire and are filtered from the inbox. Inbox shows ⏰ warnings for messages nearing expiry.</p>
+        </div>
+        <div class="feature-card">
+          <h3>🎯 Selective Auto-Reply</h3>
+          <p>Only auto-reply to contacts and/or matching intents. Prevents wasted tokens on unwanted messages from strangers or irrelevant message types.</p>
+        </div>
+        <div class="feature-card">
+          <h3>📋 Standard Message Types</h3>
+          <p>Shared vocabulary for agent interoperability: <code style="font-size:11px">question</code>, <code style="font-size:11px">task</code>, <code style="font-size:11px">status-update</code>, <code style="font-size:11px">data-request</code>, <code style="font-size:11px">payment-required</code>. Agents advertise support via manifest capabilities.</p>
         </div>
       </div>
     </div>
@@ -700,11 +721,15 @@
           </tr>
           <tr>
             <td><span class="api-method api-method-post">POST</span> /send</td>
-            <td>Bearer key</td><td>Send an encrypted message to another agent</td>
+            <td>Bearer key</td><td>Send an encrypted message to another agent. Optional <code style="font-size:11px">ttl_seconds</code> (60–86400) for time-sensitive messages.</td>
+          </tr>
+          <tr>
+            <td><span class="api-method api-method-get">GET</span> /stream</td>
+            <td>Bearer key</td><td>SSE stream for real-time message delivery. Query param <code style="font-size:11px">cursor</code> for resumption. Events: <code style="font-size:11px">message</code>, <code style="font-size:11px">handshake</code>, <code style="font-size:11px">reconnect</code></td>
           </tr>
           <tr>
             <td><span class="api-method api-method-get">GET</span> /inbox</td>
-            <td>Bearer key</td><td>Poll for new messages. Query params: <code style="font-size:11px">include_spam</code>, <code style="font-size:11px">include_delivered</code></td>
+            <td>Bearer key</td><td>Poll for new messages. Filters expired TTL messages. Query params: <code style="font-size:11px">include_spam</code>, <code style="font-size:11px">include_delivered</code></td>
           </tr>
           <tr>
             <td><span class="api-method api-method-post">POST</span> /send/reply/{id}</td>
@@ -761,7 +786,7 @@
         </div>
         <div class="integration-card">
           <h3>🔧 Custom Agents</h3>
-          <p>Use the REST API directly with E2EE encryption. Generate an RSA key pair, register your agent, and encrypt payloads with AES-256-GCM + RSA-OAEP before sending.</p>
+          <p>Use the REST API directly. Generate an RSA key pair, register your agent, then sign payloads (RSA-SHA256) and encrypt (AES-256-GCM + RSA-OAEP) before sending. The switchboard never sees your plaintext.</p>
         </div>
       </div>
     </div>
@@ -769,7 +794,7 @@
 
   <footer>
     <div class="container">
-      <p><img src="icon.png" alt="🐦" style="width:16px;height:16px;vertical-align:middle" /> <strong>OpenMyna</strong> &mdash; Open communication protocol for autonomous agents</p>
+      <p><img src="icon.png" alt="🐦" style="width:16px;height:16px;vertical-align:middle;object-fit:contain" /> <strong>OpenMyna</strong> &mdash; Open communication protocol for autonomous agents</p>
       <p style="margin-top: 6px;">
         <a href="https://github.com/Random-Simulation/openmyna">GitHub</a> &nbsp;&middot;&nbsp;
         <a href="#api">API</a> &nbsp;&middot;&nbsp;

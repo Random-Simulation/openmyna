@@ -32,12 +32,14 @@ interface Message {
   attempts: number;
   created_at: string;
   delivered_at: string | null;
+  expires_at: string | null;  // TTL expiry timestamp
 }
 
 interface SendRequest {
   to: string;
   type?: string;
   payload: unknown;
+  ttl_seconds?: number;  // optional TTL in seconds (60-86400)
 }
 
 interface InboxMessage {
@@ -49,6 +51,7 @@ interface InboxMessage {
   spam: boolean;
   read: boolean;
   created_at: string;
+  expires_at?: string | null;  // TTL expiry timestamp
 }
 
 // --- Bindings ---
@@ -68,6 +71,8 @@ const AGENTS_PAGE_SIZE = 50; // default page size for /agents
 const MAX_AGENTS_PAGE_SIZE = 100; // hard cap on /agents page size
 const MESSAGE_RETENTION_DAYS = 30; // delete delivered messages after this many days
 const FAILED_MESSAGE_RETENTION_DAYS = 7; // delete permanently failed messages sooner
+const MIN_TTL_SECONDS = 60; // minimum TTL: 1 minute
+const MAX_TTL_SECONDS = 86400; // maximum TTL: 24 hours
 
 // --- Helpers ---
 
@@ -164,6 +169,110 @@ async function incrementAttempts(db: D1Database, messageId: string): Promise<voi
     )
     .bind(messageId)
     .run();
+}
+
+// --- SSE Event Queue (KV-based) ---
+// Fire an SSE event for the recipient agent. Stored in KV so the /stream endpoint can pick it up.
+async function fireSseEvent(
+  agentId: string,
+  messageId: string,
+  type: string,
+  env: Env
+): Promise<void> {
+  // Atomically increment cursor and store event
+  const cursorKey = `sse:${agentId}:cursor`;
+  const raw = await env.RATE_LIMIT.get(cursorKey);
+  const cursor = parseInt(raw ?? "0", 10) + 1;
+
+  // Update cursor
+  await env.RATE_LIMIT.put(cursorKey, String(cursor), { expirationTtl: 300 });
+
+  // Store event (5-min TTL — enough for client to pick up on reconnect)
+  const eventKey = `sse:${agentId}:${cursor}`;
+  await env.RATE_LIMIT.put(eventKey, JSON.stringify({
+    id: cursor,
+    event: type === "handshake" ? "handshake" : "message",
+    message_id: messageId,
+  }), { expirationTtl: 300 });
+}
+
+// --- SSE Stream Endpoint ---
+async function handleSseStream(request: Request, env: Env): Promise<Response> {
+  const agent = await authenticateAgent(new Headers(request.headers), env.DB);
+  const url = new URL(request.url);
+  let cursor = parseInt(url.searchParams.get("cursor") ?? "0", 10);
+
+  const stream = new ReadableStream({
+    async start(controller) {
+      const encoder = new TextEncoder();
+      const writeSse = (event: string, data: string, id?: number) => {
+        let line = "";
+        if (id !== undefined) line += `id: ${id}\n`;
+        if (event) line += `event: ${event}\n`;
+        line += `data: ${data}\n\n`;
+        controller.enqueue(encoder.encode(line));
+      };
+      const writeComment = (comment: string) => {
+        controller.enqueue(encoder.encode(`: ${comment}\n\n`));
+      };
+
+      try {
+        let idle = 0;
+        const TIMEOUT = 120; // seconds — reconnect before CF worker timeout (150s)
+
+        while (idle < TIMEOUT) {
+          // Check for pending events
+          const events = await env.RATE_LIMIT.list({ prefix: `sse:${agent.id}:`, limit: 10 });
+          const pending = events.keys
+            .filter(k => {
+              const parts = k.name.split(":");
+              const evtCursor = parseInt(parts[2], 10);
+              return evtCursor > cursor;
+            })
+            .sort((a, b) => parseInt(a.name.split(":")[2], 10) - parseInt(b.name.split(":")[2], 10));
+
+          if (pending.length > 0) {
+            for (const key of pending) {
+              const evt = JSON.parse(await env.RATE_LIMIT.get(key.name) ?? "{}");
+              writeSse(evt.event || "message", evt.message_id || "", evt.id);
+              cursor = Math.max(cursor, evt.id);
+              // Clean up delivered event
+              await env.RATE_LIMIT.delete(key.name);
+            }
+            idle = 0;
+          } else {
+            // Keepalive every 15s (prevents proxy timeouts)
+            if (idle > 0 && idle % 15 === 0) {
+              writeComment("keepalive");
+            }
+
+            // Reconnect signal at 115s
+            if (idle >= 115) {
+              writeSse("reconnect", "");
+              break;
+            }
+
+            idle++;
+            // Sleep 1s before next check
+            await new Promise(r => setTimeout(r, 1000));
+          }
+        }
+      } catch (err) {
+        // Client disconnected or error
+      }
+
+      controller.close();
+    },
+  });
+
+  return new Response(stream, {
+    headers: {
+      "Content-Type": "text/event-stream",
+      "Cache-Control": "no-cache",
+      "Connection": "keep-alive",
+      "X-Accel-Buffering": "no",
+    },
+  });
 }
 
 // --- Routes ---
@@ -310,9 +419,16 @@ async function handleSend(request: Request, env: Env): Promise<Response> {
   // If not allowed, mark as spam
   const status = permission.allowed ? "queued" : "spam";
 
+  // Compute expires_at from ttl_seconds
+  let expiresAt: string | null = null;
+  if (body.ttl_seconds != null) {
+    const ttl = Math.max(MIN_TTL_SECONDS, Math.min(MAX_TTL_SECONDS, body.ttl_seconds));
+    expiresAt = new Date(Date.now() + ttl * 1000).toISOString();
+  }
+
   await env.DB
     .prepare(
-      "INSERT INTO messages (id, from_agent_id, to_agent_id, type, payload, reply_to, status) VALUES (?, ?, ?, ?, ?, ?, ?)"
+      "INSERT INTO messages (id, from_agent_id, to_agent_id, type, payload, reply_to, status, expires_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
     )
     .bind(
       messageId,
@@ -321,12 +437,16 @@ async function handleSend(request: Request, env: Env): Promise<Response> {
       body.type ?? "message",
       JSON.stringify(body.payload),
       replyTo,
-      status
+      status,
+      expiresAt
     )
     .run();
 
   // Only deliver non-spam messages immediately
   if (permission.allowed) {
+    // Fire SSE event for real-time delivery
+    await fireSseEvent(target.id, messageId, body.type ?? "message", env);
+
     const message = await env.DB
       .prepare("SELECT * FROM messages WHERE id = ?")
       .bind(messageId)
@@ -378,6 +498,7 @@ async function handleInbox(request: Request, env: Env): Promise<Response> {
       "SELECT m.*, a.name as from_name FROM messages m " +
         "JOIN agents a ON m.from_agent_id = a.id " +
         `WHERE m.to_agent_id = ? AND m.status IN (${statusPlaceholders}) ` +
+        "AND (m.expires_at IS NULL OR m.expires_at > strftime('%Y-%m-%dT%H:%M:%fZ', 'now')) " +
         "ORDER BY m.created_at DESC LIMIT ?"
     )
     .bind(agent.id, ...statuses.map(s => s as string), limit)
@@ -408,6 +529,7 @@ async function handleInbox(request: Request, env: Env): Promise<Response> {
     spam: m.status === "spam",
     read: m.status === "delivered",
     created_at: m.created_at as string,
+    expires_at: m.expires_at as string | null,
   }));
 
   return jsonResponse({ messages: inbox });
@@ -447,6 +569,9 @@ async function handleReply(
     )
     .bind(replyId, sender.id, original.from_agent_id, JSON.stringify(body.payload), replyTo)
     .run();
+
+  // Fire SSE event for real-time delivery
+  await fireSseEvent(original.from_agent_id, replyId, "reply", env);
 
   const replyMessage = await env.DB
     .prepare("SELECT * FROM messages WHERE id = ?")
@@ -877,6 +1002,9 @@ async function handleHandshake(request: Request, env: Env): Promise<Response> {
     )
     .run();
 
+  // Fire SSE event for real-time delivery
+  await fireSseEvent(target.id, messageId, "handshake", env);
+
   // Deliver via webhook if target has one
   const replyMessage = await env.DB
     .prepare("SELECT * FROM messages WHERE id = ?")
@@ -917,9 +1045,15 @@ export const scheduled: ExportedHandler<Env>["scheduled"] = async (_controller, 
     .bind(failedCutoff)
     .run();
 
+  // Delete TTL-expired messages (expires_at is set but has passed)
+  const expiredDeleted = await env.DB
+    .prepare("DELETE FROM messages WHERE expires_at IS NOT NULL AND expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')")
+    .run();
+
   console.log(
     `Cleanup: deleted ${deliveredDeleted.results?.length ?? 0} delivered, ` +
-    `${failedDeleted.results?.length ?? 0} failed messages (as of ${now})`
+    `${failedDeleted.results?.length ?? 0} failed, ` +
+    `${expiredDeleted.results?.length ?? 0} expired messages (as of ${now})`
   );
 };
 
@@ -955,6 +1089,8 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
       response = await handleRegister(request, env);
     } else if (path === "/send" && method === "POST") {
       response = await handleSend(request, env);
+    } else if (path === "/stream" && method === "GET") {
+      response = await handleSseStream(request, env);
     } else if (path === "/inbox" && method === "GET") {
       response = await handleInbox(request, env);
     } else if (path === "/agents" && method === "GET") {
@@ -982,11 +1118,12 @@ async function handleRequest(request: Request, env: Env): Promise<Response> {
     } else if (path === "/" && method === "GET") {
       response = jsonResponse({
         name: "OpenMyna Switchboard",
-        version: "0.4.0-manifest",
+        version: "0.6.0-ttl",
         endpoints: {
           "POST /register": "Register a new agent (accepts public_key_pem for E2EE)",
-          "POST /send": "Send a message to another agent (payload can be encrypted blob)",
-          "GET /inbox": "Poll for messages (returns encrypted payloads)",
+          "POST /send": "Send a message to another agent (payload can be encrypted blob; supports ttl_seconds)",
+          "GET /stream": "SSE stream for real-time message delivery (use ?cursor=N for resumption)",
+          "GET /inbox": "Poll for messages (returns encrypted payloads; filters expired TTL messages)",
           "POST /send/reply/{messageId}": "Reply to a message",
           "GET /agents": "List all registered agents (use ?q=search for discovery)",
           "GET /agent/{name}": "Get agent info (includes public_key_pem, manifest)",

@@ -39,6 +39,15 @@ interface OpenMynaConfig {
   maxChainDepth?: number;
   maxOutboundPerHour?: number;
   pinnedKeys?: Record<string, string>;  // agent_name -> public_key_pem (TOFU)
+  // Selective auto-reply: only auto-reply to contacts and/or matching intents
+  autoReplyContactsOnly?: boolean;   // default: true — skip auto-reply for non-contacts
+  autoReplyIntents?: string[];       // default: undefined (all intents allowed)
+}
+
+interface DecryptResult {
+  payload: unknown;
+  verified: boolean;    // true if signature was present AND verified against pinned key
+  senderName?: string;  // sender name from signature metadata (if signed)
 }
 
 const DEFAULT_CONFIG: OpenMynaConfig = {
@@ -50,6 +59,7 @@ const DEFAULT_CONFIG: OpenMynaConfig = {
   maxChainDepth: 5,
   maxOutboundPerHour: 30,
   pinnedKeys: {},
+  autoReplyContactsOnly: true,
 };
 
 function loadConfig(): OpenMynaConfig {
@@ -100,8 +110,30 @@ function getOrCreateKeyPair(): { publicKeyPem: string; privateKeyPem: string } {
 }
 
 // Encrypt payload using recipient's Public Key (hybrid: AES-256-GCM + RSA-OAEP)
-function encryptPayload(payload: unknown, recipientPublicKeyPem: string): string {
-  const dataToEncrypt = Buffer.from(JSON.stringify(payload), "utf-8");
+// Optionally signs with sender's private key first (sign-then-encrypt)
+function encryptPayload(
+  payload: unknown,
+  recipientPublicKeyPem: string,
+  senderPrivateKeyPem?: string,
+  senderName?: string
+): string {
+  // Sign-then-encrypt: sign the plaintext, wrap with signature metadata, then encrypt
+  let dataToSign: unknown = payload;
+  if (senderPrivateKeyPem && senderName) {
+    const payloadBuffer = Buffer.from(JSON.stringify(payload), "utf-8");
+    try {
+      const signature = crypto.sign(
+        "sha256",
+        payloadBuffer,
+        { key: senderPrivateKeyPem, padding: crypto.constants.RSA_PKCS1_PADDING }
+      ).toString("base64");
+      dataToSign = { _signature: signature, _sender: senderName, _payload: payload };
+    } catch {
+      // Signing failed — proceed unsigned (still encrypted)
+    }
+  }
+
+  const dataToEncrypt = Buffer.from(JSON.stringify(dataToSign), "utf-8");
 
   // 1. Generate a one-time symmetric key and IV
   const symmetricKey = crypto.randomBytes(32); // AES-256
@@ -199,18 +231,52 @@ function getPrivateKey(): string {
   return cachedPrivateKey;
 }
 
-// Try to decrypt a payload; return decrypted or original if not encrypted
-function tryDecryptPayload(data: unknown): unknown {
+// Try to decrypt a payload; return structured result with payload + signature verification
+function tryDecryptPayload(data: unknown): DecryptResult {
   if (!isEncryptedPayload(data)) {
-    return data;
+    return { payload: data, verified: false };
   }
 
   try {
     const privateKeyPem = getPrivateKey();
     const encryptedStr = typeof data === "string" ? data : JSON.stringify(data);
-    return decryptPayload(encryptedStr, privateKeyPem);
+    const decrypted = decryptPayload(encryptedStr, privateKeyPem);
+
+    // Check for signed payload wrapper (sign-then-encrypt)
+    if (typeof decrypted === "object" && decrypted !== null &&
+        "_signature" in decrypted && "_sender" in decrypted && "_payload" in decrypted) {
+      const sigObj = decrypted as Record<string, unknown>;
+      const senderName = sigObj._sender as string;
+      const signature = sigObj._signature as string;
+      const innerPayload = sigObj._payload;
+
+      // Verify signature against sender's pinned public key (TOFU)
+      const senderPublicKey = getPinnedKey(senderName);
+      let verified = false;
+      if (senderPublicKey) {
+        try {
+          const payloadBuffer = Buffer.from(JSON.stringify(innerPayload), "utf-8");
+          verified = crypto.verify(
+            "sha256",
+            payloadBuffer,
+            { key: senderPublicKey, format: "pem" },
+            Buffer.from(signature, "base64")
+          );
+        } catch {
+          // Verification failed
+        }
+      }
+
+      return { payload: innerPayload, verified, senderName };
+    }
+
+    // No signature — unsigned payload (backward compatible)
+    return { payload: decrypted, verified: false };
   } catch {
-    return { _error: "[Encrypted content — decryption failed. Key mismatch or corrupted data.]" };
+    return {
+      payload: { _error: "[Encrypted content — decryption failed. Key mismatch or corrupted data.]" },
+      verified: false,
+    };
   }
 }
 
@@ -366,6 +432,126 @@ function logOutboundSuccess(pi: ExtensionAPI): void {
   pi.appendEntry("openmyna-outbound-log", { ts: Date.now() });
 }
 
+// --- Contacts cache (for auto-reply filtering) ---
+
+let contactsCache: string[] | null = null;
+let contactsCacheTime = 0;
+const CONTACTS_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
+
+async function loadContactsCache(creds: AgentCredentials): Promise<string[]> {
+  // Return cached list if still valid
+  if (contactsCache && Date.now() - contactsCacheTime < CONTACTS_CACHE_TTL) {
+    return contactsCache;
+  }
+  const result = await apiRequest("/contacts", { method: "GET" }, creds);
+  if (result.ok) {
+    const contacts = (result.data as { contacts?: unknown[] })?.contacts ?? [];
+    contactsCache = contacts.map((c: any) => c.name as string);
+    contactsCacheTime = Date.now();
+    return contactsCache;
+  }
+  return [];
+}
+
+// Check if auto-reply should be skipped for a message
+// Returns null if auto-reply is allowed, or a reason string if skipped
+function shouldSkipAutoReply(
+  config: OpenMynaConfig,
+  senderName: string,
+  intent: string | null,
+  contacts: string[]
+): string | null {
+  // Check contacts-only filter
+  if (config.autoReplyContactsOnly && contacts.length > 0 && !contacts.includes(senderName)) {
+    return `sender '${senderName}' not in contacts`;
+  }
+
+  // Check intent allowlist
+  if (config.autoReplyIntents && config.autoReplyIntents.length > 0) {
+    const messageIntent = intent ?? "message";
+    if (!config.autoReplyIntents.includes(messageIntent)) {
+      return `intent '${messageIntent}' not in allowlist [${config.autoReplyIntents.join(", ")}]`;
+    }
+  }
+
+  return null;
+}
+
+// --- Standard Message Types ---
+// Well-known message type schemas for agent interoperability.
+// Agents advertise support via manifest capabilities.
+
+export const STANDARD_MESSAGE_TYPES = {
+  question: {
+    description: "A question expecting a reply",
+    fields: { text: "string", expects_reply: "boolean", ttl_seconds: "number?" },
+  },
+  task: {
+    description: "A task request with priority",
+    fields: { description: "string", priority: "low|medium|high", deadline: "string?" },
+  },
+  "status-update": {
+    description: "Status update for a task or operation",
+    fields: { status: "processing|done|failed", result: "string?", error: "string?" },
+  },
+  "data-request": {
+    description: "Request for structured data",
+    fields: { format: "json|csv|text", fields: "string[]?", limit: "number?" },
+  },
+  "payment-required": {
+    description: "Indicates a payment is needed",
+    fields: { amount: "number", currency: "string", description: "string" },
+  },
+} as const;
+
+// Validate a payload against a standard message type schema (lightweight, no enforcement)
+export function validateMessageType(
+  type: string,
+  payload: unknown
+): { valid: boolean; errors: string[] } {
+  const schema = STANDARD_MESSAGE_TYPES[type as keyof typeof STANDARD_MESSAGE_TYPES];
+  if (!schema) {
+    return { valid: true, errors: [] }; // Unknown types pass through
+  }
+
+  const errors: string[] = [];
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+    return { valid: false, errors: ["Payload must be a JSON object"] };
+  }
+
+  const obj = payload as Record<string, unknown>;
+  const fieldDefs = schema.fields as Record<string, string>;
+
+  for (const [field, typeDef] of Object.entries(fieldDefs)) {
+    const optional = typeDef.endsWith("?");
+    const baseType = optional ? typeDef.slice(0, -1) : typeDef;
+
+    if (obj[field] === undefined) {
+      if (!optional) errors.push(`Missing required field '${field}'`);
+      continue;
+    }
+
+    // Basic type checks
+    if (baseType === "string" && typeof obj[field] !== "string") {
+      errors.push(`Field '${field}' must be a string`);
+    } else if (baseType === "number" && typeof obj[field] !== "number") {
+      errors.push(`Field '${field}' must be a number`);
+    } else if (baseType === "boolean" && typeof obj[field] !== "boolean") {
+      errors.push(`Field '${field}' must be a boolean`);
+    } else if (baseType === "string[]" && !Array.isArray(obj[field])) {
+      errors.push(`Field '${field}' must be an array`);
+    } else if (baseType === "low|medium|high" && !["low", "medium", "high"].includes(obj[field] as string)) {
+      errors.push(`Field '${field}' must be one of: low, medium, high`);
+    } else if (baseType === "processing|done|failed" && !["processing", "done", "failed"].includes(obj[field] as string)) {
+      errors.push(`Field '${field}' must be one of: processing, done, failed`);
+    } else if (baseType === "json|csv|text" && !["json", "csv", "text"].includes(obj[field] as string)) {
+      errors.push(`Field '${field}' must be one of: json, csv, text`);
+    }
+  }
+
+  return { valid: errors.length === 0, errors };
+}
+
 // --- HTTP helpers ---
 
 async function apiRequest(
@@ -399,9 +585,128 @@ async function fetchPublicKey(agentName: string): Promise<{ ok: boolean; key: st
   return { ok: true, key: data.public_key_pem as string | null };
 }
 
-// --- Polling ---
+// --- Real-time: SSE stream with polling fallback ---
 
 let pollTimer: ReturnType<typeof setInterval> | null = null;
+let sseAbortController: AbortController | null = null;
+let sseActive = false;
+let sseFailStreak = 0;
+const MAX_SSE_FAILURES = 3; // after N failures, fall back to polling
+let sseCursor = 0; // tracks last SSE event ID seen
+
+// Parse SSE stream and trigger inbox check on new events
+async function connectSseStream(ctx: ExtensionContext, pi: ExtensionAPI): Promise<void> {
+  if (sseActive) return;
+  sseActive = true;
+  sseAbortController = new AbortController();
+
+  const creds = loadCredentials(ctx);
+  if (!creds) { sseActive = false; return; }
+
+  const url = `${apiUrl()}/stream?cursor=${sseCursor}`;
+
+  try {
+    const resp = await fetch(url, {
+      method: "GET",
+      headers: {
+        "Authorization": `Bearer ${creds.api_key}`,
+        "Accept": "text/event-stream",
+      },
+      signal: sseAbortController.signal,
+    });
+
+    if (!resp.ok || !resp.body) {
+      throw new Error(`SSE connection failed: ${resp.status}`);
+    }
+
+    sseFailStreak = 0; // reset failure counter on successful connect
+    ctx.ui.setStatus("openmyna", `🐦 ${creds.name} (stream)`);
+
+    // Read SSE stream line by line
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = "";
+
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+
+      buffer += decoder.decode(value, { stream: true });
+
+      // Process complete SSE messages (terminated by double newline)
+      const parts = buffer.split("\n\n");
+      buffer = parts.pop() ?? ""; // keep incomplete last chunk
+
+      for (const part of parts) {
+        const lines = part.trim().split("\n");
+        let eventId: number | undefined;
+        let eventType = "message";
+        let eventData = "";
+
+        for (const line of lines) {
+          if (line.startsWith("id: ")) {
+            eventId = parseInt(line.slice(4), 10);
+          } else if (line.startsWith("event: ")) {
+            eventType = line.slice(7);
+          } else if (line.startsWith("data: ")) {
+            eventData = line.slice(6);
+          } else if (line.startsWith(":")) {
+            // comment (keepalive) — ignore
+          }
+        }
+
+        if (eventId !== undefined) {
+          sseCursor = eventId;
+        }
+
+        if (eventType === "reconnect") {
+          // Server is about to timeout — reconnect gracefully
+          break;
+        }
+
+        if ((eventType === "message" || eventType === "handshake") && eventData) {
+          // New message event — trigger inbox check immediately
+          await checkInbox(ctx, pi);
+        }
+      }
+    }
+  } catch (err: any) {
+    if (err?.name === "AbortError") {
+      return; // intentional disconnect
+    }
+    sseFailStreak++;
+  } finally {
+    sseActive = false;
+  }
+}
+
+// SSE connection manager: connect → on disconnect, retry or fall back to polling
+async function startSseStream(ctx: ExtensionContext, pi: ExtensionAPI): Promise<void> {
+  if (pollTimer) return; // already running
+
+  const retry = async () => {
+    if (!sseAbortController?.signal.aborted) {
+      await connectSseStream(ctx, pi);
+    }
+    if (sseFailStreak >= MAX_SSE_FAILURES) {
+      ctx.ui.notify("🐦 SSE stream unavailable, falling back to polling", "info");
+      startPolling(ctx, pi);
+      return;
+    }
+    // Reconnect after 2s delay
+    setTimeout(retry, 2000);
+  };
+
+  retry();
+}
+
+function stopSseStream(): void {
+  sseActive = false;
+  if (sseAbortController) {
+    sseAbortController.abort();
+    sseAbortController = null;
+  }
+}
 
 async function checkInbox(ctx: ExtensionContext, pi: ExtensionAPI): Promise<void> {
   const creds = loadCredentials(ctx);
@@ -427,10 +732,12 @@ async function checkInbox(ctx: ExtensionContext, pi: ExtensionAPI): Promise<void
     const id = msg.id as string;
 
     if (!knownIds.has(id)) {
-      // E2EE: Decrypt payload if encrypted
+      // E2EE: Decrypt payload if encrypted (returns structured DecryptResult)
       let decryptedPayload = msg.payload;
       if (isEncryptedPayload(msg.payload)) {
-        decryptedPayload = tryDecryptPayload(msg.payload);
+        const decryptResult = tryDecryptPayload(msg.payload);
+        decryptedPayload = decryptResult.payload;
+        msg.payload = decryptedPayload; // replace with decrypted for formatting below
       }
 
       // E2EE: If handshake message, pin sender's public key (TOFU)
@@ -496,9 +803,58 @@ async function checkInbox(ctx: ExtensionContext, pi: ExtensionAPI): Promise<void
       return `  ${m.id}: depth ${depth}`;
     }).join("\n");
 
+    // --- Selective auto-reply: load contacts and check filters ---
+    let autoReplySkipped = false;
+    let autoReplySkipReasons: string[] = [];
+    let autoReplyMessages: Record<string, unknown>[] = [];
+
+    if (config.onNewMessage === "auto-reply" && !maxDepthExceeded) {
+      // Load contacts for filtering (async — fire and use in instruction)
+      const contacts = await loadContactsCache(creds!);
+
+      for (const m of normalMessages) {
+        const senderName = m.from ?? "unknown";
+        const intent = extractIntent(m.payload);
+        const skipReason = shouldSkipAutoReply(config, senderName, intent, contacts);
+
+        if (skipReason) {
+          autoReplySkipped = true;
+          autoReplySkipReasons.push(`  - ${m.id} from ${senderName}: Auto-reply skipped (${skipReason})`);
+        } else {
+          autoReplyMessages.push(m);
+        }
+      }
+    }
+
     let instruction = "";
     if (config.onNewMessage === "auto-reply" && !maxDepthExceeded) {
-      instruction = `You have ${count} new OpenMyna message(s):\n\n${securityDirective}\n\n${formattedMessages}${spamNote}\n\nThread depths (for reply tracking):\n${depthLookup}\n\nYou may respond autonomously using openmyna_send or openmyna_reply. Keep replies brief (max ${config.maxAutoReplyLength} chars). When replying with openmyna_reply, include chain_depth in your payload set to the current depth + 1.`;
+      if (autoReplyMessages.length > 0) {
+        // Build instructions only for messages that passed the auto-reply filter
+        const autoReplyFormatted = autoReplyMessages.map((m) => {
+          const from = m.from ?? "unknown";
+          const depth = (m.chain_depth as number) || resolveChainDepth(ctx, m);
+          const readableText = extractMessageText(m.payload);
+          const intent = extractIntent(m.payload);
+          const intentLine = intent ? ` | Intent: ${intent}` : "";
+          return `Message ID: ${m.id} | From: ${from}${intentLine} | Thread Depth: ${depth}\n<incoming_message>\n${readableText}\n</incoming_message>`;
+        }).join("\n\n---\n\n");
+
+        const autoReplyDepthLookup = autoReplyMessages.map((m) => {
+          const depth = (m.chain_depth as number) || resolveChainDepth(ctx, m);
+          return `  ${m.id}: depth ${depth}`;
+        }).join("\n");
+
+        instruction = `You have ${autoReplyMessages.length} OpenMyna message(s) eligible for auto-reply:\n\n${securityDirective}\n\n${autoReplyFormatted}${spamNote}\n\nThread depths (for reply tracking):\n${autoReplyDepthLookup}\n\nYou may respond autonomously using openmyna_send or openmyna_reply. Keep replies brief (max ${config.maxAutoReplyLength} chars). When replying with openmyna_reply, include chain_depth in your payload set to the current depth + 1.`;
+
+        if (autoReplySkipped && autoReplySkipReasons.length > 0) {
+          instruction += `\n\nSkipped auto-reply for ${autoReplySkipReasons.length} message(s):\n${autoReplySkipReasons.join("\n")}`;
+        }
+      } else if (autoReplySkipped) {
+        // All messages were skipped — notify but don't trigger auto-reply
+        instruction = `All ${count} message(s) were skipped for auto-reply:\n${autoReplySkipReasons.join("\n")}\n\nNo auto-reply will be sent. Use openmyna_inbox to review manually.`;
+      } else {
+        instruction = `You have ${count} new OpenMyna message(s):\n\n${securityDirective}\n\n${formattedMessages}${spamNote}\n\nThread depths (for reply tracking):\n${depthLookup}\n\nYou may respond autonomously using openmyna_send or openmyna_reply. Keep replies brief (max ${config.maxAutoReplyLength} chars). When replying with openmyna_reply, include chain_depth in your payload set to the current depth + 1.`;
+      }
     } else {
       const depthWarning = maxDepthExceeded ? `\n\n⚠️ LOOP PREVENTION ACTIVE: One or more threads reached the maximum conversation depth of ${maxAllowedDepth}. Auto-reply has been temporarily suspended to prevent infinite loops.` : "";
       instruction = `You have ${count} new OpenMyna message(s):\n\n${securityDirective}\n\n${formattedMessages}${spamNote}${depthWarning}\n\nThread depths:\n${depthLookup}\n\nPlease print the message(s) and ask the user what they'd like to do. Do not auto-reply without explicit permission.`;
@@ -537,13 +893,14 @@ export default function (pi: ExtensionAPI) {
     const creds = loadCredentials(ctx);
     if (creds) {
       ctx.ui.setStatus("openmyna", `🐦 ${creds.name}`);
-      startPolling(ctx, pi);
+      startSseStream(ctx, pi);
     } else {
       ctx.ui.setStatus("openmyna", "🐦 not registered");
     }
   });
 
   pi.on("session_shutdown", async (_event, _ctx) => {
+    stopSseStream();
     stopPolling();
   });
 
@@ -594,7 +951,7 @@ export default function (pi: ExtensionAPI) {
         // ignore write failures
       }
       ctx.ui.setStatus("openmyna", `🐦 ${creds.name} (${visibility})`);
-      startPolling(ctx, pi);
+      startSseStream(ctx, pi);
 
       return { content: [{ type: "text", text: `Registered as '${creds.name}'. API key saved. E2EE key pair generated.` }] };
     },
@@ -609,6 +966,7 @@ export default function (pi: ExtensionAPI) {
       to: Type.String({ description: "Target agent name" }),
       intent: Type.Optional(Type.String({ description: "Subject/intent line (e.g. 'question', 'status-update', 'handshake-response')" })),
       payload: Type.Any({ description: "Message content JSON" }),
+      ttl_seconds: Type.Optional(Type.Number({ description: "Time-to-live in seconds. Message is dropped after expiry (useful for time-sensitive queries). Min: 60, Max: 86400 (24h)" })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const creds = loadCredentials(ctx);
@@ -644,14 +1002,25 @@ export default function (pi: ExtensionAPI) {
         pinKey(params.to, keyResult.key);
       }
 
-      // E2EE: Encrypt payload
+      // E2EE: Sign-then-encrypt payload
       const properties: Record<string, unknown> = { chain_depth: 1 };
       if (params.intent) properties.intent = params.intent;
-      const encryptedPayload = encryptPayload(enrichPayload(params.payload, properties), keyResult.key);
+      const senderPrivateKey = getPrivateKey();
+      const encryptedPayload = encryptPayload(
+        enrichPayload(params.payload, properties),
+        keyResult.key,
+        senderPrivateKey,
+        creds.name
+      );
 
+      const sendBody: Record<string, unknown> = { to: params.to, payload: encryptedPayload };
+      if (params.ttl_seconds != null) {
+        const ttl = Math.max(60, Math.min(86400, params.ttl_seconds));
+        sendBody.ttl_seconds = ttl;
+      }
       const result = await apiRequest("/send", {
         method: "POST",
-        body: JSON.stringify({ to: params.to, payload: encryptedPayload }),
+        body: JSON.stringify(sendBody),
       }, creds);
 
       const data = result.data as Record<string, unknown>;
@@ -663,7 +1032,8 @@ export default function (pi: ExtensionAPI) {
       }
 
       logOutboundSuccess(pi);
-      return { content: [{ type: "text", text: `Message sent to '${params.to}' (id: ${data.message_id}). Encrypted with E2EE.` }] };
+      const ttlNote = params.ttl_seconds != null ? ` TTL: ${params.ttl_seconds}s.` : "";
+      return { content: [{ type: "text", text: `Message sent to '${params.to}' (id: ${data.message_id}). Encrypted with E2EE.${ttlNote}` }] };
     },
   });
 
@@ -702,15 +1072,39 @@ export default function (pi: ExtensionAPI) {
         const readTag = m.read ? " 📩 [READ]" : " 🆕 [NEW]";
 
         // E2EE: Decrypt payload & extract readable text
-        const decrypted = tryDecryptPayload(m.payload);
+        const decryptResult = tryDecryptPayload(m.payload);
+        const decrypted = decryptResult.payload;
         const text = typeof decrypted === "object" && decrypted !== null && "_error" in decrypted
           ? (decrypted._error as string)
           : extractMessageText(decrypted);
         const intent = extractIntent(decrypted);
         const intentLine = intent ? `\n   Intent: ${intent}` : "";
 
+        // Signature verification indicator
+        let sigTag = "";
+        if (decryptResult.verified) {
+          sigTag = ` ✅ [SIGNED: ${decryptResult.senderName}]`;
+        } else if (isEncryptedPayload(m.payload)) {
+          sigTag = " 🔓 [UNSIGNED]";
+        }
+
+        // TTL expiry warning
+        let ttlLine = "";
+        if (m.expires_at) {
+          const expiresAt = new Date(m.expires_at).getTime();
+          const now = Date.now();
+          const remaining = expiresAt - now;
+          if (remaining < 0) {
+            ttlLine = "\n   ⏰ EXPIRED";
+          } else if (remaining < 60000) {
+            ttlLine = `\n   ⏰ Expires in ${Math.ceil(remaining / 1000)}s`;
+          } else if (remaining < 600000) {
+            ttlLine = `\n   ⏰ Expires in ${Math.ceil(remaining / 60000)}m`;
+          }
+        }
+
         const replyTo = m.reply_to ?? "none";
-        return `${i + 1}. From: ${from}${spamTag}${readTag}\n   ID: ${msgId}${intentLine}\n   Content: ${text}\n   Reply to: ${replyTo}`;
+        return `${i + 1}. From: ${from}${spamTag}${readTag}${sigTag}\n   ID: ${msgId}${intentLine}${ttlLine}\n   Content: ${text}\n   Reply to: ${replyTo}`;
       }).join("\n\n");
 
       ctx.ui.setStatus("openmyna", `🐦 ${creds.name}`);
@@ -793,10 +1187,16 @@ export default function (pi: ExtensionAPI) {
       const currentDepth = getChainDepth(ctx, params.message_id);
       const newDepth = currentDepth + 1;
 
-      // E2EE: Encrypt payload
+      // E2EE: Sign-then-encrypt payload
       const replyProperties: Record<string, unknown> = { chain_depth: newDepth };
       if (params.intent) replyProperties.intent = params.intent;
-      const encryptedPayload = encryptPayload(enrichPayload(params.payload, replyProperties), keyResult.key);
+      const senderPrivateKey = getPrivateKey();
+      const encryptedPayload = encryptPayload(
+        enrichPayload(params.payload, replyProperties),
+        keyResult.key,
+        senderPrivateKey,
+        creds.name
+      );
 
       const result = await apiRequest(`/send/reply/${params.message_id}`, {
         method: "POST",
