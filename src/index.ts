@@ -171,32 +171,26 @@ async function incrementAttempts(db: D1Database, messageId: string): Promise<voi
     .run();
 }
 
-// --- SSE Event Queue (KV-based) ---
-// Fire an SSE event for the recipient agent. Stored in KV so the /stream endpoint can pick it up.
+// --- SSE Event Queue (D1-based) ---
+// Fire an SSE event for the recipient agent. Stored in D1 (not KV) to stay within
+// KV free tier limits (1,000 reads/day). D1 free tier allows 50,000 reads/day.
+// Events are cleaned up by the daily cron (older than 5 minutes).
 async function fireSseEvent(
   agentId: string,
   messageId: string,
-  type: string,
+  eventType: string,
   env: Env
 ): Promise<void> {
-  // Atomically increment cursor and store event
-  const cursorKey = `sse:${agentId}:cursor`;
-  const raw = await env.RATE_LIMIT.get(cursorKey);
-  const cursor = parseInt(raw ?? "0", 10) + 1;
-
-  // Update cursor
-  await env.RATE_LIMIT.put(cursorKey, String(cursor), { expirationTtl: 300 });
-
-  // Store event (5-min TTL — enough for client to pick up on reconnect)
-  const eventKey = `sse:${agentId}:${cursor}`;
-  await env.RATE_LIMIT.put(eventKey, JSON.stringify({
-    id: cursor,
-    event: type === "handshake" ? "handshake" : "message",
-    message_id: messageId,
-  }), { expirationTtl: 300 });
+  await env.DB
+    .prepare(
+      "INSERT INTO sse_events (agent_id, message_id, event) VALUES (?, ?, ?)"
+    )
+    .bind(agentId, messageId, eventType === "handshake" ? "handshake" : "message")
+    .run();
 }
 
-// --- SSE Stream Endpoint ---
+// --- SSE Stream Endpoint (D1-based) ---
+// Uses D1 instead of KV for event storage. D1 free tier: 50,000 reads/day vs KV: 1,000.
 async function handleSseStream(request: Request, env: Env): Promise<Response> {
   const agent = await authenticateAgent(new Headers(request.headers), env.DB);
   const url = new URL(request.url);
@@ -205,9 +199,8 @@ async function handleSseStream(request: Request, env: Env): Promise<Response> {
   const stream = new ReadableStream({
     async start(controller) {
       const encoder = new TextEncoder();
-      const writeSse = (event: string, data: string, id?: number) => {
-        let line = "";
-        if (id !== undefined) line += `id: ${id}\n`;
+      const writeSse = (event: string, data: string, id: number) => {
+        let line = `id: ${id}\n`;
         if (event) line += `event: ${event}\n`;
         line += `data: ${data}\n\n`;
         controller.enqueue(encoder.encode(line));
@@ -221,23 +214,24 @@ async function handleSseStream(request: Request, env: Env): Promise<Response> {
         const TIMEOUT = 120; // seconds — reconnect before CF worker timeout (150s)
 
         while (idle < TIMEOUT) {
-          // Check for pending events
-          const events = await env.RATE_LIMIT.list({ prefix: `sse:${agent.id}:`, limit: 10 });
-          const pending = events.keys
-            .filter(k => {
-              const parts = k.name.split(":");
-              const evtCursor = parseInt(parts[2], 10);
-              return evtCursor > cursor;
-            })
-            .sort((a, b) => parseInt(a.name.split(":")[2], 10) - parseInt(b.name.split(":")[2], 10));
+          // Check for pending events via D1 (not KV)
+          const result = await env.DB
+            .prepare(
+              "SELECT id, event, message_id FROM sse_events " +
+              "WHERE agent_id = ? AND id > ? " +
+              "ORDER BY id ASC LIMIT 10"
+            )
+            .bind(agent.id, cursor)
+            .all<Record<string, unknown>>();
 
-          if (pending.length > 0) {
-            for (const key of pending) {
-              const evt = JSON.parse(await env.RATE_LIMIT.get(key.name) ?? "{}");
-              writeSse(evt.event || "message", evt.message_id || "", evt.id);
-              cursor = Math.max(cursor, evt.id);
-              // Clean up delivered event
-              await env.RATE_LIMIT.delete(key.name);
+          if (result.results.length > 0) {
+            for (const evt of result.results) {
+              writeSse(
+                (evt.event as string) || "message",
+                (evt.message_id as string) || "",
+                evt.id as number
+              );
+              cursor = Math.max(cursor, evt.id as number);
             }
             idle = 0;
           } else {
@@ -248,7 +242,7 @@ async function handleSseStream(request: Request, env: Env): Promise<Response> {
 
             // Reconnect signal at 115s
             if (idle >= 115) {
-              writeSse("reconnect", "");
+              writeSse("reconnect", "", cursor);
               break;
             }
 
@@ -366,19 +360,22 @@ async function checkMessagePermission(
   return { allowed: false, reason: `Agent '${target.name}' is private and you have not added them as a contact` };
 }
 
-// Server-side rate limiting: checks KV for how many messages an agent sent this hour
+// Server-side rate limiting: counts messages in D1 (not KV) to stay within KV free tier.
+// D1 free tier: 50,000 reads/day. KV free tier: 1,000 reads/day.
 async function checkOutboundRateLimit(
   agentId: string,
   env: Env,
   limit: number = MAX_OUTBOUND_PER_HOUR
 ): Promise<boolean> {
-  const hourKey = `rate-msg:${agentId}:${Math.floor(Date.now() / 3600000)}`;
-  const current = parseInt(await env.RATE_LIMIT.get(hourKey) ?? "0", 10);
-  if (current >= limit) {
-    return false;
-  }
-  await env.RATE_LIMIT.put(hourKey, String(current + 1), { expirationTtl: 3600 });
-  return true;
+  const oneHourAgo = new Date(Date.now() - 3600000).toISOString();
+  const result = await env.DB
+    .prepare(
+      "SELECT COUNT(*) as count FROM messages WHERE from_agent_id = ? AND created_at >= ?"
+    )
+    .bind(agentId, oneHourAgo)
+    .first<{ count: number }>();
+
+  return (result?.count ?? 0) < limit;
 }
 
 async function handleSend(request: Request, env: Env): Promise<Response> {
@@ -599,7 +596,7 @@ async function handleAgents(request: Request, env: Env): Promise<Response> {
   );
   const offset = (page - 1) * pageSize;
 
-  // Simple KV cache for the agents directory (60s TTL)
+  // Simple KV cache for the agents directory (600s TTL — minimized KV reads)
   const cacheKey = `agents-cache:${query || "all"}:${page}:${pageSize}`;
   const cached = await env.RATE_LIMIT.get(cacheKey);
   if (cached) {
@@ -667,8 +664,8 @@ async function handleAgents(request: Request, env: Env): Promise<Response> {
     },
   };
 
-  // Cache the result for 60 seconds
-  await env.RATE_LIMIT.put(cacheKey, JSON.stringify(response), { expirationTtl: 60 });
+  // Cache the result for 600 seconds (10 minutes — minimizes KV reads)
+  await env.RATE_LIMIT.put(cacheKey, JSON.stringify(response), { expirationTtl: 600 });
 
   return jsonResponse(response);
 }
@@ -1026,7 +1023,7 @@ async function handleHandshake(request: Request, env: Env): Promise<Response> {
   });
 }
 
-// --- Scheduled cleanup: purge old messages to prevent unbounded DB growth ---
+// --- Scheduled cleanup: purge old messages + SSE events to prevent unbounded DB growth ---
 
 export const scheduled: ExportedHandler<Env>["scheduled"] = async (_controller, env): Promise<void> => {
   const now = new Date().toISOString();
@@ -1050,10 +1047,18 @@ export const scheduled: ExportedHandler<Env>["scheduled"] = async (_controller, 
     .prepare("DELETE FROM messages WHERE expires_at IS NOT NULL AND expires_at <= strftime('%Y-%m-%dT%H:%M:%fZ', 'now')")
     .run();
 
+  // Delete old SSE events (older than 5 minutes — clients should have picked them up by now)
+  const sseCutoff = new Date(Date.now() - 5 * 60 * 1000).toISOString();
+  const sseDeleted = await env.DB
+    .prepare("DELETE FROM sse_events WHERE created_at < ?")
+    .bind(sseCutoff)
+    .run();
+
   console.log(
     `Cleanup: deleted ${deliveredDeleted.results?.length ?? 0} delivered, ` +
     `${failedDeleted.results?.length ?? 0} failed, ` +
-    `${expiredDeleted.results?.length ?? 0} expired messages (as of ${now})`
+    `${expiredDeleted.results?.length ?? 0} expired messages, ` +
+    `${sseDeleted.results?.length ?? 0} SSE events (as of ${now})`
   );
 };
 
