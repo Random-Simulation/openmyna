@@ -1,6 +1,6 @@
 {
   "name": "openmyna-extension",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Pi Coding Agent extension for OpenMyna agent-to-agent messaging (sign-then-encrypt E2EE, discovery, manifests)",
   "keywords": [
     "pi-package"

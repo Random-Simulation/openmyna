@@ -280,6 +280,180 @@ function tryDecryptPayload(data: unknown): DecryptResult {
   }
 }
 
+// --- File encryption (binary data, separate from JSON payload encryption) ---
+// Encrypt a raw file buffer using hybrid crypto (AES-256-GCM + RSA-OAEP).
+// Returns base64-encoded encrypted blob for transport.
+function encryptFile(
+  fileBuffer: Buffer,
+  recipientPublicKeyPem: string
+): string {
+  // 1. Generate one-time symmetric key and IV
+  const symmetricKey = crypto.randomBytes(32); // AES-256
+  const iv = crypto.randomBytes(16);
+
+  // 2. Encrypt the raw file bytes
+  const cipher = crypto.createCipheriv("aes-256-gcm", symmetricKey, iv);
+  const encryptedData = Buffer.concat([cipher.update(fileBuffer), cipher.final()]);
+  const authTag = cipher.getAuthTag();
+
+  // 3. Encrypt the symmetric key with recipient's public key
+  const encryptedSymmetricKey = crypto.publicEncrypt(
+    {
+      key: recipientPublicKeyPem,
+      padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
+      oaepHash: "sha256",
+    },
+    symmetricKey
+  );
+
+  // 4. Package: encryptedKey(256) + iv(16) + authTag(16) + ciphertext(N)
+  // Return as base64 for transport
+  const blob = Buffer.concat([encryptedSymmetricKey, iv, authTag, encryptedData]);
+  return blob.toString("base64");
+}
+
+// Decrypt a file blob (base64-encoded) using local private key.
+// Returns raw Buffer.
+function decryptFile(encryptedBase64: string, localPrivateKeyPem: string): Buffer {
+  const blob = Buffer.from(encryptedBase64, "base64");
+
+  // Normalize key to PKCS#1
+  let privateKeyStr = localPrivateKeyPem;
+  if (!privateKeyStr.includes("BEGIN RSA PRIVATE KEY")) {
+    const keyObj = crypto.createPrivateKey(privateKeyStr);
+    privateKeyStr = keyObj.export({ type: "pkcs1", format: "pem" }) as string;
+  }
+
+  // Extract components: encryptedKey(256) + iv(16) + authTag(16) + ciphertext(N)
+  const encryptedSymmetricKey = blob.slice(0, 256);
+  const iv = blob.slice(256, 272);
+  const authTag = blob.slice(272, 288);
+  const ciphertext = blob.slice(288);
+
+  // 1. Decrypt symmetric key
+  const symmetricKey = crypto.privateDecrypt(
+    {
+      key: privateKeyStr,
+      padding: crypto.constants.RSA_PKCS1_OAEP_PADDING,
+      oaepHash: "sha256",
+    },
+    encryptedSymmetricKey
+  );
+
+  // 2. Decrypt file data
+  const decipher = crypto.createDecipheriv("aes-256-gcm", symmetricKey, iv);
+  decipher.setAuthTag(authTag);
+
+  return Buffer.concat([
+    decipher.update(ciphertext),
+    decipher.final(),
+  ]);
+}
+
+// Detect MIME type from file extension
+function detectMimeType(filename: string): string {
+  const ext = filename.split(".").pop()?.toLowerCase() ?? "";
+  const mimeMap: Record<string, string> = {
+    txt: "text/plain", md: "text/markdown", json: "application/json",
+    xml: "application/xml", yaml: "text/yaml", yml: "text/yaml",
+    html: "text/html", css: "text/css", js: "text/javascript",
+    ts: "text/typescript", py: "text/x-python", sh: "text/x-shellscript",
+    patch: "text/plain", diff: "text/plain", log: "text/plain",
+    csv: "text/csv", sql: "text/x-sql", toml: "text/toml",
+    png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg",
+    gif: "image/gif", webp: "image/webp", svg: "image/svg+xml",
+    pdf: "application/pdf", zip: "application/zip",
+    tar: "application/x-tar", gz: "application/gzip",
+  };
+  return mimeMap[ext] ?? "application/octet-stream";
+}
+
+// Upload an encrypted file to the storage endpoint.
+// Returns { r2_key, name, mime, size } metadata.
+async function uploadAttachment(
+  filePath: string,
+  recipientPublicKeyPem: string,
+  messageId: string,
+  creds: AgentCredentials,
+  ttlSeconds?: number
+): Promise<{ r2_key: string; name: string; mime: string; size: number } | null> {
+  try {
+    const fileBuffer = fs.readFileSync(filePath);
+    const filename = path.basename(filePath);
+    const mime = detectMimeType(filename);
+
+    // Encrypt the file
+    const encryptedBase64 = encryptFile(fileBuffer, recipientPublicKeyPem);
+    const encryptedBuffer = Buffer.from(encryptedBase64, "utf-8");
+
+    // Upload to storage endpoint
+    const url = `${apiUrl()}/storage/upload`;
+    const headers: Record<string, string> = {
+      "Authorization": `Bearer ${creds.api_key}`,
+      "Content-Type": "application/octet-stream",
+      "X-Attachment-Filename": filename,
+      "X-Attachment-Mime": mime,
+      "X-Attachment-Message-Id": messageId,
+    };
+    if (ttlSeconds) {
+      headers["X-Attachment-Ttl"] = String(ttlSeconds);
+    }
+
+    const resp = await fetch(url, {
+      method: "POST",
+      headers,
+      body: encryptedBuffer,
+    });
+
+    if (!resp.ok) {
+      const error = await resp.json().catch(() => ({ error: "Unknown error" }));
+      console.error(`Upload failed for ${filename}:`, error);
+      return null;
+    }
+
+    const data = await resp.json();
+    return {
+      r2_key: data.r2_key as string,
+      name: data.name as string,
+      mime: data.mime as string,
+      size: data.size as number,
+    };
+  } catch (err) {
+    console.error(`Failed to process attachment ${filePath}:`, err);
+    return null;
+  }
+}
+
+// Download an attachment from the storage endpoint and decrypt it.
+// Returns the decrypted file buffer, or null on failure.
+async function downloadAttachment(
+  r2Key: string,
+  creds: AgentCredentials
+): Promise<Buffer | null> {
+  try {
+    const url = `${apiUrl()}/storage/${encodeURIComponent(r2Key)}`;
+    const resp = await fetch(url, {
+      method: "GET",
+      headers: {
+        "Authorization": `Bearer ${creds.api_key}`,
+      },
+    });
+
+    if (!resp.ok) {
+      const error = await resp.json().catch(() => ({ error: "Unknown error" }));
+      console.error(`Download failed for ${r2Key}:`, error);
+      return null;
+    }
+
+    const encryptedBuffer = Buffer.from(await resp.arrayBuffer());
+    const privateKeyPem = getPrivateKey();
+    return decryptFile(encryptedBuffer.toString("utf-8"), privateKeyPem);
+  } catch (err) {
+    console.error(`Failed to download/decrypt attachment ${r2Key}:`, err);
+    return null;
+  }
+}
+
 // Extract intent (subject line) from a decrypted payload
 function extractIntent(payload: unknown): string | null {
   if (typeof payload === "object" && payload !== null && !Array.isArray(payload)) {
@@ -792,7 +966,20 @@ async function checkInbox(ctx: ExtensionContext, pi: ExtensionAPI): Promise<void
       const readableText = extractMessageText(m.payload);
       const intent = extractIntent(m.payload);
       const intentLine = intent ? ` | Intent: ${intent}` : "";
-      return `Message ID: ${m.id} | From: ${from}${intentLine} | Thread Depth: ${depth}\n<incoming_message>\n${readableText}\n</incoming_message>`;
+
+      // Attachment info
+      let attachInfo = "";
+      if (typeof m.payload === "object" && m.payload !== null && "attachments" in m.payload) {
+        const attachments = (m.payload as Record<string, unknown>).attachments as Array<Record<string, unknown>>;
+        if (attachments && attachments.length > 0) {
+          const fileList = attachments.map((a: Record<string, unknown>) =>
+            `${a.name as string} (r2_key: ${a.r2_key as string})`
+          ).join(", ");
+          attachInfo = `\n   📎 Attachments: ${fileList}. Use openmyna_download with r2_key to retrieve.`;
+        }
+      }
+
+      return `Message ID: ${m.id} | From: ${from}${intentLine} | Thread Depth: ${depth}\n<incoming_message>\n${readableText}\n</incoming_message>${attachInfo}`;
     }).join("\n\n---\n\n");
 
     const spamNote = spamCount > 0 ? `\n\n(${spamCount} blocked message(s) from non-contacts — use openmyna_inbox with include_spam=true to view)` : "";
@@ -836,7 +1023,19 @@ async function checkInbox(ctx: ExtensionContext, pi: ExtensionAPI): Promise<void
           const readableText = extractMessageText(m.payload);
           const intent = extractIntent(m.payload);
           const intentLine = intent ? ` | Intent: ${intent}` : "";
-          return `Message ID: ${m.id} | From: ${from}${intentLine} | Thread Depth: ${depth}\n<incoming_message>\n${readableText}\n</incoming_message>`;
+
+          let attachInfo = "";
+          if (typeof m.payload === "object" && m.payload !== null && "attachments" in m.payload) {
+            const attachments = (m.payload as Record<string, unknown>).attachments as Array<Record<string, unknown>>;
+            if (attachments && attachments.length > 0) {
+              const fileList = attachments.map((a: Record<string, unknown>) =>
+                `${a.name as string} (r2_key: ${a.r2_key as string})`
+              ).join(", ");
+              attachInfo = `\n   📎 Attachments: ${fileList}. Use openmyna_download with r2_key to retrieve.`;
+            }
+          }
+
+          return `Message ID: ${m.id} | From: ${from}${intentLine} | Thread Depth: ${depth}\n<incoming_message>\n${readableText}\n</incoming_message>${attachInfo}`;
         }).join("\n\n---\n\n");
 
         const autoReplyDepthLookup = autoReplyMessages.map((m) => {
@@ -960,13 +1159,14 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "openmyna_send",
     label: "OpenMyna Send",
-    description: "Send a message to another agent on the OpenMyna switchboard.",
+    description: "Send a message to another agent on the OpenMyna switchboard. Optionally attach files.",
     promptSnippet: "Send message to another agent via OpenMyna switchboard",
     parameters: Type.Object({
       to: Type.String({ description: "Target agent name" }),
       intent: Type.Optional(Type.String({ description: "Subject/intent line (e.g. 'question', 'status-update', 'handshake-response')" })),
       payload: Type.Any({ description: "Message content JSON" }),
       ttl_seconds: Type.Optional(Type.Number({ description: "Time-to-live in seconds. Message is dropped after expiry (useful for time-sensitive queries). Min: 60, Max: 86400 (24h)" })),
+      attachments: Type.Optional(Type.Array(Type.String(), { description: "Array of local file paths to attach. Each file is encrypted E2EE and uploaded to storage. Max 10 files, 500KB each." })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const creds = loadCredentials(ctx);
@@ -981,6 +1181,23 @@ export default function (pi: ExtensionAPI) {
       const payloadSize = Buffer.byteLength(payloadString, 'utf8');
       if (payloadSize > MAX_PAYLOAD_BYTES) {
         return { content: [{ type: "text", text: `Send failed: Payload size (${payloadSize} bytes) exceeds the protocol max limit of ${MAX_PAYLOAD_BYTES} bytes.` }], isError: true };
+      }
+
+      // Validate attachments
+      const attachmentPaths = params.attachments as string[] | undefined;
+      if (attachmentPaths && attachmentPaths.length > 10) {
+        return { content: [{ type: "text", text: `Send failed: Too many attachments. Maximum 10 files per message.` }], isError: true };
+      }
+      if (attachmentPaths) {
+        for (const filePath of attachmentPaths) {
+          if (!fs.existsSync(filePath)) {
+            return { content: [{ type: "text", text: `Send failed: Attachment file not found: ${filePath}` }], isError: true };
+          }
+          const stat = fs.statSync(filePath);
+          if (stat.size > 512000) {
+            return { content: [{ type: "text", text: `Send failed: File too large (${stat.size} bytes). Maximum 500KB per attachment.` }], isError: true };
+          }
+        }
       }
 
       // E2EE: Fetch recipient's public key
@@ -1002,9 +1219,33 @@ export default function (pi: ExtensionAPI) {
         pinKey(params.to, keyResult.key);
       }
 
-      // E2EE: Sign-then-encrypt payload
+      // Generate message ID client-side (so attachments can reference it before message is sent)
+      const messageId = crypto.randomUUID();
+
+      // Upload attachments (if any) — encrypted with recipient's public key
+      const uploadedAttachments: Array<{ name: string; mime: string; size: number; r2_key: string }> = [];
+      if (attachmentPaths) {
+        for (const filePath of attachmentPaths) {
+          const result = await uploadAttachment(
+            filePath,
+            keyResult.key!,
+            messageId,
+            creds,
+            params.ttl_seconds
+          );
+          if (!result) {
+            return { content: [{ type: "text", text: `Send failed: Could not upload attachment '${path.basename(filePath)}'.` }], isError: true };
+          }
+          uploadedAttachments.push(result);
+        }
+      }
+
+      // E2EE: Sign-then-encrypt payload (include attachment metadata)
       const properties: Record<string, unknown> = { chain_depth: 1 };
       if (params.intent) properties.intent = params.intent;
+      if (uploadedAttachments.length > 0) {
+        properties.attachments = uploadedAttachments;
+      }
       const senderPrivateKey = getPrivateKey();
       const encryptedPayload = encryptPayload(
         enrichPayload(params.payload, properties),
@@ -1013,7 +1254,11 @@ export default function (pi: ExtensionAPI) {
         creds.name
       );
 
-      const sendBody: Record<string, unknown> = { to: params.to, payload: encryptedPayload };
+      const sendBody: Record<string, unknown> = {
+        to: params.to,
+        payload: encryptedPayload,
+        message_id: messageId,  // client-generated ID for attachment linking
+      };
       if (params.ttl_seconds != null) {
         const ttl = Math.max(60, Math.min(86400, params.ttl_seconds));
         sendBody.ttl_seconds = ttl;
@@ -1033,7 +1278,10 @@ export default function (pi: ExtensionAPI) {
 
       logOutboundSuccess(pi);
       const ttlNote = params.ttl_seconds != null ? ` TTL: ${params.ttl_seconds}s.` : "";
-      return { content: [{ type: "text", text: `Message sent to '${params.to}' (id: ${data.message_id}). Encrypted with E2EE.${ttlNote}` }] };
+      const attachNote = uploadedAttachments.length > 0
+        ? ` Attached: ${uploadedAttachments.map(a => a.name).join(", ")}.`
+        : "";
+      return { content: [{ type: "text", text: `Message sent to '${params.to}' (id: ${data.message_id}). Encrypted with E2EE.${ttlNote}${attachNote}` }] };
     },
   });
 
@@ -1103,8 +1351,24 @@ export default function (pi: ExtensionAPI) {
           }
         }
 
+        // Attachment indicator
+        let attachLine = "";
+        if (typeof decrypted === "object" && decrypted !== null && "attachments" in decrypted) {
+          const attachments = (decrypted as Record<string, unknown>).attachments as Array<Record<string, unknown>>;
+          if (attachments && attachments.length > 0) {
+            const fileList = attachments.map((a: Record<string, unknown>) => {
+              const name = a.name as string;
+              const size = a.size as number;
+              const r2Key = a.r2_key as string;
+              const sizeStr = size > 1024 ? `${(size / 1024).toFixed(1)}KB` : `${size}B`;
+              return `${name} (${sizeStr}, r2_key: ${r2Key})`;
+            }).join(", ");
+            attachLine = `\n   📎 Attachments: ${fileList}. Use openmyna_download with r2_key to retrieve.`;
+          }
+        }
+
         const replyTo = m.reply_to ?? "none";
-        return `${i + 1}. From: ${from}${spamTag}${readTag}${sigTag}\n   ID: ${msgId}${intentLine}${ttlLine}\n   Content: ${text}\n   Reply to: ${replyTo}`;
+        return `${i + 1}. From: ${from}${spamTag}${readTag}${sigTag}\n   ID: ${msgId}${intentLine}${ttlLine}${attachLine}\n   Content: ${text}\n   Reply to: ${replyTo}`;
       }).join("\n\n");
 
       ctx.ui.setStatus("openmyna", `🐦 ${creds.name}`);
@@ -1115,12 +1379,13 @@ export default function (pi: ExtensionAPI) {
   pi.registerTool({
     name: "openmyna_reply",
     label: "OpenMyna Reply",
-    description: "Reply to a specific OpenMyna message by its message ID.",
+    description: "Reply to a specific OpenMyna message by its message ID. Optionally attach files.",
     promptSnippet: "Reply to an OpenMyna message by ID",
     parameters: Type.Object({
       message_id: Type.String({ description: "The message ID to reply to" }),
       intent: Type.Optional(Type.String({ description: "Subject/intent line for this reply" })),
       payload: Type.Any({ description: "Reply content JSON value." }),
+      attachments: Type.Optional(Type.Array(Type.String(), { description: "Array of local file paths to attach. Each file is encrypted E2EE and uploaded to storage. Max 10 files, 500KB each." })),
     }),
     async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
       const creds = loadCredentials(ctx);
@@ -1135,6 +1400,23 @@ export default function (pi: ExtensionAPI) {
       const payloadSize = Buffer.byteLength(payloadString, 'utf8');
       if (payloadSize > MAX_PAYLOAD_BYTES) {
         return { content: [{ type: "text", text: `Reply failed: Payload size (${payloadSize} bytes) exceeds the protocol max limit of ${MAX_PAYLOAD_BYTES} bytes.` }], isError: true };
+      }
+
+      // Validate attachments
+      const attachmentPaths = params.attachments as string[] | undefined;
+      if (attachmentPaths && attachmentPaths.length > 10) {
+        return { content: [{ type: "text", text: `Reply failed: Too many attachments. Maximum 10 files per message.` }], isError: true };
+      }
+      if (attachmentPaths) {
+        for (const filePath of attachmentPaths) {
+          if (!fs.existsSync(filePath)) {
+            return { content: [{ type: "text", text: `Reply failed: Attachment file not found: ${filePath}` }], isError: true };
+          }
+          const stat = fs.statSync(filePath);
+          if (stat.size > 512000) {
+            return { content: [{ type: "text", text: `Reply failed: File too large (${stat.size} bytes). Maximum 500KB per attachment.` }], isError: true };
+          }
+        }
       }
 
       // E2EE: Look up the original message to find the recipient
@@ -1187,9 +1469,32 @@ export default function (pi: ExtensionAPI) {
       const currentDepth = getChainDepth(ctx, params.message_id);
       const newDepth = currentDepth + 1;
 
+      // Generate message ID for the reply (for attachment linking)
+      const replyMessageId = crypto.randomUUID();
+
+      // Upload attachments (if any)
+      const uploadedAttachments: Array<{ name: string; mime: string; size: number; r2_key: string }> = [];
+      if (attachmentPaths) {
+        for (const filePath of attachmentPaths) {
+          const result = await uploadAttachment(
+            filePath,
+            keyResult.key!,
+            replyMessageId,
+            creds
+          );
+          if (!result) {
+            return { content: [{ type: "text", text: `Reply failed: Could not upload attachment '${path.basename(filePath)}'.` }], isError: true };
+          }
+          uploadedAttachments.push(result);
+        }
+      }
+
       // E2EE: Sign-then-encrypt payload
       const replyProperties: Record<string, unknown> = { chain_depth: newDepth };
       if (params.intent) replyProperties.intent = params.intent;
+      if (uploadedAttachments.length > 0) {
+        replyProperties.attachments = uploadedAttachments;
+      }
       const senderPrivateKey = getPrivateKey();
       const encryptedPayload = encryptPayload(
         enrichPayload(params.payload, replyProperties),
@@ -1200,7 +1505,7 @@ export default function (pi: ExtensionAPI) {
 
       const result = await apiRequest(`/send/reply/${params.message_id}`, {
         method: "POST",
-        body: JSON.stringify({ payload: encryptedPayload }),
+        body: JSON.stringify({ payload: encryptedPayload, message_id: replyMessageId }),
       }, creds);
 
       if (!result.ok) {
@@ -1211,7 +1516,63 @@ export default function (pi: ExtensionAPI) {
       logOutboundSuccess(pi);
 
       const data = result.data as Record<string, unknown>;
-      return { content: [{ type: "text", text: `Reply sent to '${recipientName}' (id: ${data.message_id}, chain_depth: ${newDepth}). Encrypted with E2EE.` }] };
+      const attachNote = uploadedAttachments.length > 0
+        ? ` Attached: ${uploadedAttachments.map(a => a.name).join(", ")}.`
+        : "";
+      return { content: [{ type: "text", text: `Reply sent to '${recipientName}' (id: ${data.message_id}, chain_depth: ${newDepth}). Encrypted with E2EE.${attachNote}` }] };
+    },
+  });
+
+  pi.registerTool({
+    name: "openmyna_download",
+    label: "OpenMyna Download",
+    description: "Download a file attachment from an OpenMyna message. Provide the r2_key from the message's attachment metadata.",
+    promptSnippet: "Download an attachment from an OpenMyna message",
+    parameters: Type.Object({
+      r2_key: Type.String({ description: "The R2 storage key of the attachment (from message attachment metadata)" }),
+      save_path: Type.Optional(Type.String({ description: "Optional local path to save the file. If omitted, returns content as text (for small text files)." })),
+    }),
+    async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+      const creds = loadCredentials(ctx);
+      if (!creds) return { content: [{ type: "text", text: "Not registered. Use openmyna_register first." }], isError: true };
+
+      const decrypted = await downloadAttachment(params.r2_key, creds);
+      if (!decrypted) {
+        return { content: [{ type: "text", text: `Download failed: Could not retrieve or decrypt attachment '${params.r2_key}'. You may not be authorized, or the attachment has expired.` }], isError: true };
+      }
+
+      // If save_path provided, write to disk
+      if (params.save_path) {
+        try {
+          // Ensure parent directory exists
+          const dir = path.dirname(params.save_path);
+          if (!fs.existsSync(dir)) {
+            fs.mkdirSync(dir, { recursive: true });
+          }
+          fs.writeFileSync(params.save_path, decrypted);
+          return { content: [{ type: "text", text: `Attachment downloaded and saved to '${params.save_path}' (${decrypted.byteLength} bytes).` }] };
+        } catch (err) {
+          return { content: [{ type: "text", text: `Failed to save file: ${err instanceof Error ? err.message : String(err)}` }], isError: true };
+        }
+      }
+
+      // Try to return as text for small files
+      if (decrypted.byteLength > 32768) {
+        return { content: [{ type: "text", text: `Attachment is ${decrypted.byteLength} bytes (binary/large). Use save_path parameter to save to disk.` }] };
+      }
+
+      // Try UTF-8 decode for text files
+      try {
+        const text = decrypted.toString("utf-8");
+        // Check if it's mostly printable text
+        const nonPrintable = (text.match(/[\x00-\x08\x0E-\x1F\x7F]/g) || []).length;
+        if (nonPrintable > text.length * 0.05) {
+          return { content: [{ type: "text", text: `Attachment is binary (${decrypted.byteLength} bytes). Use save_path parameter to save to disk.` }] };
+        }
+        return { content: [{ type: "text", text: `--- Attachment content (${decrypted.byteLength} bytes) ---\n${text}\n--- End ---` }] };
+      } catch {
+        return { content: [{ type: "text", text: `Attachment is binary (${decrypted.byteLength} bytes). Use save_path parameter to save to disk.` }] };
+      }
     },
   });
 
