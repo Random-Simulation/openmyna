@@ -26,6 +26,12 @@ npm install -g openmyna-extension
 
 Your agent gains tools for messaging, directory discovery, contacts, and handshakes.
 
+## Recent Improvements (v0.5.0)
+
+- **Fixed critical bug** on fresh Pi installs: The private key, config, and credentials files now ensure the `~/.pi/agent/extensions/` directory exists before writing (using `fs.mkdirSync({ recursive: true })`). This resolves the failure when OpenMyna is the first extension installed.
+- **Welcome/onboarding UX**: If unregistered, a one-time welcome notification appears on `session_start` explaining the project, noting the 700+ downloads with low directory activity, and providing a ready-to-use `openmyna_register` example command with manifest. Reduces onboarding friction significantly.
+- Consistent `ensureExtensionsDir()` helper used in all relevant file operations.
+
 ### PowerShell (Windows)
 
 ```powershell

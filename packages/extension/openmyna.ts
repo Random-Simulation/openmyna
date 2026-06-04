@@ -13,6 +13,17 @@ const CONFIG_PATH = path.join(USER_HOME, ".pi", "agent", "extensions", "openmyna
 const PRIVATE_KEY_PATH = path.join(USER_HOME, ".pi", "agent", "extensions", "openmyna-private.pem");
 const CREDENTIALS_PATH = path.join(USER_HOME, ".pi", "agent", "extensions", "openmyna-creds.json");
 
+function ensureExtensionsDir(): void {
+  const extensionsDir = path.dirname(CONFIG_PATH);
+  if (!fs.existsSync(extensionsDir)) {
+    try {
+      fs.mkdirSync(extensionsDir, { recursive: true, mode: 0o700 });
+    } catch (err) {
+      console.error("Failed to create .pi/agent/extensions directory:", err);
+    }
+  }
+}
+
 interface AgentCredentials {
   name: string;
   agent_id: string;
@@ -42,6 +53,7 @@ interface OpenMynaConfig {
   // Selective auto-reply: only auto-reply to contacts and/or matching intents
   autoReplyContactsOnly?: boolean;   // default: true — skip auto-reply for non-contacts
   autoReplyIntents?: string[];       // default: undefined (all intents allowed)
+  welcomeShown?: boolean;
 }
 
 interface DecryptResult {
@@ -60,9 +72,11 @@ const DEFAULT_CONFIG: OpenMynaConfig = {
   maxOutboundPerHour: 30,
   pinnedKeys: {},
   autoReplyContactsOnly: true,
+  welcomeShown: false,
 };
 
 function loadConfig(): OpenMynaConfig {
+  ensureExtensionsDir();
   try {
     if (fs.existsSync(CONFIG_PATH)) {
       const raw = fs.readFileSync(CONFIG_PATH, "utf-8");
@@ -75,6 +89,7 @@ function loadConfig(): OpenMynaConfig {
 }
 
 function saveConfig(config: OpenMynaConfig): void {
+  ensureExtensionsDir();
   try {
     fs.writeFileSync(CONFIG_PATH, JSON.stringify(config, null, 2), { mode: 0o600 });
   } catch {
@@ -86,6 +101,7 @@ function saveConfig(config: OpenMynaConfig): void {
 
 // Generate and save local RSA key pair if it doesn't exist
 function getOrCreateKeyPair(): { publicKeyPem: string; privateKeyPem: string } {
+  ensureExtensionsDir();
   if (fs.existsSync(PRIVATE_KEY_PATH)) {
     const rawKey = fs.readFileSync(PRIVATE_KEY_PATH, "utf-8");
     // Normalize to PKCS#1 for consistent OAEP decryption
@@ -223,6 +239,7 @@ function isEncryptedPayload(data: unknown): boolean {
 let cachedPrivateKey: string | null = null;
 
 function getPrivateKey(): string {
+  ensureExtensionsDir();
   if (cachedPrivateKey) return cachedPrivateKey;
   const raw = fs.readFileSync(PRIVATE_KEY_PATH, "utf-8");
   // Normalize to PKCS#1 for OAEP decryption
@@ -522,6 +539,7 @@ function setChainDepth(pi: ExtensionAPI, messageId: string, depth: number): void
 // --- State helpers ---
 
 function loadCredentials(ctx: ExtensionContext): AgentCredentials | null {
+  ensureExtensionsDir();
   // First check session entries (current session)
   const entries = ctx.sessionManager.getEntries();
   for (const entry of entries) {
@@ -1095,6 +1113,21 @@ export default function (pi: ExtensionAPI) {
       startSseStream(ctx, pi);
     } else {
       ctx.ui.setStatus("openmyna", "🐦 not registered");
+      const config = loadConfig();
+      if (!config.welcomeShown) {
+        ctx.ui.notify(
+          "🐦 Welcome to OpenMyna!\n\n" +
+          "OpenMyna is an open E2EE agent-to-agent messaging protocol — like email, but for AI agents.\n\n" +
+          "To get started, register a unique name (lowercase, hyphens OK):\n" +
+          "→ openmyna_register name: \"your-name\"\n\n" +
+          "After registering you can send/receive messages, discover other agents, manage contacts, and set a manifest so others can find you.\n\n" +
+          "Optional — set your manifest for discovery:\n" +
+          "→ openmyna_set_manifest description: \"Helpful coding agent\" capabilities: [\"code-review\", \"refactoring\"] tags: [\"assistant\"]",
+          "info"
+        );
+        config.welcomeShown = true;
+        saveConfig(config);
+      }
     }
   });
 
@@ -1144,6 +1177,7 @@ export default function (pi: ExtensionAPI) {
       const creds: AgentCredentials = { name: params.name, agent_id: data.agent_id as string, api_key: data.api_key as string };
       pi.appendEntry("openmyna-creds", creds);
       // Persist credentials to disk so they survive across sessions
+      ensureExtensionsDir();
       try {
         fs.writeFileSync(CREDENTIALS_PATH, JSON.stringify(creds, null, 2), { mode: 0o600 });
       } catch {
